@@ -296,6 +296,10 @@ pub const TXT2_FEATURES: [(&str, &str); 7] = [("20", "calt"), ("23", "frac"), ("
 /// (`ss01`..`ss20`).
 pub const TXT2_STYLISTIC_SETS: &str = "85";
 
+/// The `Txt2` style key for old-style figures (2 when on, 0 when off). Photoshop keeps this flag
+/// in `Txt2` and no longer writes the EngineData `OldStyle` boolean.
+pub const TXT2_OLD_STYLE: &str = "30";
+
 /// Sets in `style` the OpenType features a `Txt2` style dictionary turns on ([`TXT2_FEATURES`]
 /// and the Stylistic Sets mask). A feature the style already sets keeps its value. A flag that is
 /// off changes nothing, except Contextual Alternates: shapers apply `calt` by default, Photoshop
@@ -312,6 +316,11 @@ fn add_txt2_features(style: &mut CharStyle, txt2_style: &E) {
             Some(false) if tag == "calt" => set(tag.to_string(), 0),
             _ => {}
         }
+    }
+    // Old-style figures: the Txt2 style key holds 2 when on. Photoshop keeps this flag in Txt2
+    // and leaves `OldStyle` out of EngineData (measured against 20.0.2), so it is read here.
+    if txt2_style.get(TXT2_OLD_STYLE).and_then(E::as_i64).is_some_and(|v| v != 0) {
+        set("onum".to_string(), 1);
     }
     // A mask beyond the 20 sets is not Photoshop's: ignore it.
     let sets = txt2_style.get(TXT2_STYLISTIC_SETS).and_then(E::as_i64).filter(|m| (0..1 << 20).contains(m)).unwrap_or(0);

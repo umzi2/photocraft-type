@@ -2151,19 +2151,37 @@ fn psd_round_trips_antialias_opentype_and_warp() {
         let back = crate::psd::text_layer_from_tysh(&bytes, 72.0).unwrap();
         assert_eq!(back.antialias, aa);
         assert_eq!(back.warp, t.warp);
-        let st = &back.char_runs()[0].style;
-        assert!(st.discretionary_ligatures);
-        let mut tags: Vec<&str> = st.features.iter().map(|f| f.tag.as_str()).collect();
-        tags.sort_unstable();
-        assert_eq!(tags, ["frac", "swsh"]);
+        // Photoshop keeps swash/fractions in the Txt2 style run and out of EngineData (measured
+        // against 20.0.2), so the file's Txt2 block is where they must land.
+        let engine_only: Vec<String> = back.char_runs()[0].style.features.iter().map(|f| f.tag.clone()).collect();
+        let mut engine_tags = engine_only.clone();
+        engine_tags.sort_unstable();
+        assert!(engine_tags.is_empty() || engine_tags == ["calt"], "EngineData carries only calt: {engine_tags:?}");
+        let txt2 = crate::psd::parse_txt2(&crate::psd::build_txt2_at(&[(0, &t)], None, 72.0)).expect("txt2");
+        let style_run = txt2
+            .path(&["1", "1"])
+            .and_then(E::as_array)
+            .and_then(|a| a.get(0))
+            .and_then(|o| o.get("0"))
+            .and_then(|m| m.path(&["6", "0"]))
+            .and_then(E::as_array)
+            .and_then(|a| a.get(0))
+            .and_then(|r| r.path(&["0", "0", "6"]))
+            .expect("the Txt2 style run");
+        for (key, tag) in [("23", "frac"), ("25", "swsh")] {
+            assert_eq!(style_run.get(key).and_then(E::as_bool), Some(true), "Txt2 {key} must switch {tag} on");
+        }
+        assert!(back.char_runs()[0].style.discretionary_ligatures);
     }
 }
 
-/// EngineData only maps Photoshop's `OldStyle` bool to `onum`. Other Numerals tags (`lnum` /
-/// `pnum` / `tnum`) stay in `.pcraft` until a Photoshop-authored PSD oracle exists — we do not
-/// invent EngineData keys or copy figure-style tables from GPL editors (AGENTS.md clean-room).
+/// Photoshop keeps the figure-style flags in the `Txt2` run sheet (`OldStyle` → key 30) and writes
+/// only `ContextualLigatures` to EngineData, so `onum` survives the document round trip and not the
+/// `TySh`-only one. Other Numerals tags (`lnum` / `pnum` / `tnum`) stay in `.pcraft` until a
+/// Photoshop-authored PSD oracle exists — we do not invent EngineData keys or copy figure-style
+/// tables from GPL editors (AGENTS.md clean-room).
 #[test]
-fn psd_engine_data_keeps_only_oldstyle_among_numeral_tags() {
+fn psd_round_trips_old_style_through_the_txt2_run_sheet() {
     let style = CharStyle {
         font_family: "Inter".into(),
         size_pt: 20.0,
@@ -2173,10 +2191,23 @@ fn psd_engine_data_keeps_only_oldstyle_among_numeral_tags() {
     let t = styled("0123456789", style);
     let bytes = crate::psd::build_tysh(&t, 72.0, None);
     let back = crate::psd::text_layer_from_tysh(&bytes, 72.0).expect("tysh");
-    let runs = back.char_runs();
-    let mut got: Vec<&str> = runs[0].style.features.iter().map(|f| f.tag.as_str()).collect();
-    got.sort_unstable();
-    assert_eq!(got, ["onum"]);
+    // EngineData no longer carries the numeral toggles: Photoshop keeps old-style figures in the
+    // Txt2 style run (key 30 = 2). Other Numerals tags stay in `.pcraft` — we do not invent
+    // EngineData keys or copy figure-style tables from GPL editors (AGENTS.md clean-room).
+    let engine_only: Vec<String> = back.char_runs()[0].style.features.iter().map(|f| f.tag.clone()).collect();
+    assert!(engine_only.is_empty(), "EngineData carries no numeral flags: {engine_only:?}");
+    let txt2 = crate::psd::parse_txt2(&crate::psd::build_txt2_at(&[(0, &t)], None, 72.0)).expect("txt2");
+    let style_run = txt2
+        .path(&["1", "1"])
+        .and_then(E::as_array)
+        .and_then(|a| a.get(0))
+        .and_then(|o| o.get("0"))
+        .and_then(|m| m.path(&["6", "0"]))
+        .and_then(E::as_array)
+        .and_then(|a| a.get(0))
+        .and_then(|r| r.path(&["0", "0", "6"]))
+        .expect("the Txt2 style run");
+    assert_eq!(style_run.get("30").and_then(E::as_i64), Some(2), "Txt2 key 30 is 2 for old-style figures");
 }
 
 /// A legacy-signature `TySh` (#1469): zero PointBase, `bounds` (the layout box) and `boundingBox`

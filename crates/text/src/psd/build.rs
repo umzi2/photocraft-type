@@ -1,5 +1,5 @@
 use super::edit::{TEMPLATE_NODES, edited_object, fits, is_stub, names_one_frame, new_object, pad_frames, td_edited_object, with_modes};
-use super::import::{OPENTYPE_KEYS, TXT2_FEATURES, TXT2_STYLISTIC_SETS, kern_units, manual, object_frame, parse_txt2, postscript_for, real};
+use super::import::{OPENTYPE_KEYS, TXT2_FEATURES, TXT2_OLD_STYLE, TXT2_STYLISTIC_SETS, kern_units, manual, object_frame, parse_txt2, postscript_for, real};
 
 use super::{
     AntiAlias, Caps, CharStyle, Color, ColorMode, D, Descriptor, E, FontBaseline, Kerning, Orientation, ParagraphStyle, TextAlign, TextLayer, TextShape, ed,
@@ -266,6 +266,9 @@ fn txt2_style_runs(layer: &TextLayer, base: &E, fonts: &mut Vec<E>, dpi: f32, se
         }
         let sets = (0..20).filter(|n| feature(&format!("ss{:02}", n + 1)) == Some(true)).fold(0i64, |m, n| m | 1 << n);
         style.set(TXT2_STYLISTIC_SETS, E::Int(sets));
+        // Old-style figures live in this slot: Photoshop writes 2 when on and keeps `OldStyle`
+        // out of EngineData (measured against 20.0.2).
+        style.set(TXT2_OLD_STYLE, E::Int(if feature("onum") == Some(true) { 2 } else { 0 }));
         style.set("11", E::Int(txt2_mode(s)));
         run.set("1", E::Int(n));
         out.push(run);
