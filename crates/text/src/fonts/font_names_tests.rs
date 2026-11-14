@@ -468,3 +468,164 @@ fn postscript_name_of_a_named_instance_lays_out_at_that_instance() {
     assert!(explicit < family * 0.8, "wdth 75 is narrower: {explicit} vs {family}");
     assert!((instance - explicit).abs() < 0.5, "instance: {instance} px, its axes: {explicit} px, default instance: {family} px");
 }
+
+// ----- Photoshop font resolution parity (task-18) -------------------------------------------
+
+/// Representative PostScript names Photoshop 20 has files for, one per family and style shape:
+/// Windows faces, Adobe application faces, the CC fonts Photoshop installs, the base-35 PDF
+/// faces and the Noto families the PSD oracle composes with.
+const PHOTOSHOP_FACES: &[&str] = &[
+    "TimesNewRomanPSMT",
+    "TimesNewRomanPS-BoldMT",
+    "TimesNewRomanPS-ItalicMT",
+    "ArialMT",
+    "Arial-BoldMT",
+    "Arial-ItalicMT",
+    "Arial-BoldItalicMT",
+    "Georgia",
+    "Georgia-Bold",
+    "Verdana",
+    "Verdana-Bold",
+    "TrebuchetMS",
+    "TrebuchetMS-Bold",
+    "Impact",
+    "ComicSansMS",
+    "CourierNewPSMT",
+    "CourierNewPS-BoldMT",
+    "MyriadPro-Regular",
+    "MinionPro-Regular",
+    "CCMeanwhile",
+    "CCMeanwhile-Bold",
+    "CCGrimNGritty-Regular",
+    "CCGrimNGritty-Italic",
+    "CCSpellcaster",
+    "CCSpellcaster-Bold",
+    "AdobeHeitiStd-Regular",
+    "Arial-Black",
+    "AndaleMono",
+    "NotoSans-Regular",
+    "NotoSans-Bold",
+    "NotoSerif-Regular",
+    "NotoSansCJKjp-Regular",
+];
+
+/// Windows fonts that ship in every Photoshop installation; without them the live assertions are
+/// skipped (CI images without the Wine prefix or its fonts).
+fn photoshop_index_or_skip() -> Option<PsFontIndex> {
+    let index = PsFontIndex::scan();
+    if index.is_empty() {
+        eprintln!("skipping: no Photoshop font sources on this machine");
+        return None;
+    }
+    Some(index)
+}
+
+/// Every Photoshop face resolves to a file whose own PostScript name is the requested one: no
+/// family guess, no fontconfig substitution (the `TimesNewRomanPSMT` → Liberation Serif case).
+#[test]
+fn photoshop_faces_resolve_to_their_own_files() {
+    let Some(index) = photoshop_index_or_skip() else { return };
+    let mut missing = Vec::new();
+    let mut wrong = Vec::new();
+    for ps in PHOTOSHOP_FACES {
+        match index.resolve(ps) {
+            Some(file) if file.postscript_name == *ps => {}
+            Some(file) => wrong.push(format!("{ps} -> {} ({})", file.location(), file.postscript_name)),
+            None => missing.push(*ps),
+        }
+    }
+    assert!(missing.is_empty(), "Photoshop faces with no file: {missing:?}");
+    assert!(wrong.is_empty(), "Photoshop faces resolved to another face: {wrong:?}");
+    // The Windows and Adobe sources are the ones a default install needs.
+    for (ps, source) in [
+        ("TimesNewRomanPSMT", PsFontSource::WindowsFonts),
+        ("ArialMT", PsFontSource::WindowsFonts),
+        ("CCGrimNGritty-Regular", PsFontSource::WindowsFonts),
+        ("MyriadPro-Regular", PsFontSource::AdobeApplication),
+        ("MinionPro-Regular", PsFontSource::AdobeApplication),
+    ] {
+        assert_eq!(index.resolve(ps).map(|f| f.source), Some(source), "{ps}");
+    }
+    // The 14 faces whose ratios Photoshop itself measured in `font_ascent.json` are all here.
+    for ps in ["CCGrimNGritty-Bold", "CCGrimNGritty-BoldItalic", "CCGrimNGritty-Regular", "CCGrimNGritty-Italic", "CCMeanwhile-Bold", "CCMeanwhile-BoldItalic", "CCMeanwhile-Italic", "CCMeanwhile", "CCSpellcaster-Bold", "CCSpellcaster-BoldItalic", "ArialMT", "NotoSans-Regular", "NotoSerif-Regular", "NotoSans-Bold"] {
+        assert!(index.resolve(ps).is_some(), "{ps} (a face Photoshop measured) is not indexed");
+    }
+}
+
+/// A request through the font database (the path the renderer and the engine use) picks the
+/// Photoshop file and never a substitute; the resolved family carries that PostScript face.
+#[test]
+fn the_database_resolves_photoshop_faces_exactly() {
+    if std::env::var_os("PHOTOCRAFT_NO_SYSTEM_FONTS").is_some() {
+        return;
+    }
+    let mut db = FontDb::with_system_fonts();
+    if db.ps_fonts().is_none_or(|i| i.is_empty()) {
+        eprintln!("skipping: no Photoshop font sources on this machine");
+        return;
+    }
+    for ps in ["TimesNewRomanPSMT", "Arial-BoldMT", "Georgia", "CCGrimNGritty-Regular", "MyriadPro-Regular", "NotoSans-Regular"] {
+        let resolved = db.resolve_postscript(ps);
+        assert!(resolved.exact, "{ps} did not resolve exactly: {resolved:?}");
+        let file = db.resolve_postscript_file(ps).expect("indexed face");
+        assert_eq!(resolved.family, file.family, "{ps}");
+        let face_has_name = db.faces(&resolved.family).iter().any(|f| f.postscript_name.as_deref() == Some(ps));
+        assert!(face_has_name, "{ps} resolved to family {:?}, whose faces do not carry it", resolved.family);
+    }
+}
+
+/// Photoshop ships one `MyriadPro-Regular.otf` and lists `MyriadPro-BoldIt` anyway: it synthesises
+/// the style from the regular face. The name must resolve into that family (never to a different
+/// family) and report the requested style, so the renderer draws a synthesised bold italic.
+#[test]
+fn a_style_without_its_own_file_stays_in_the_photoshop_family() {
+    let Some(index) = photoshop_index_or_skip() else { return };
+    let Some(regular) = index.resolve("MyriadPro-Regular") else { return };
+    for (ps, weight, italic) in [("MyriadPro-Bold", 700, false), ("MyriadPro-It", 400, true), ("MyriadPro-BoldIt", 700, true)] {
+        let r = index.resolve_style(ps).unwrap_or_else(|| panic!("{ps} must resolve into Myriad Pro"));
+        assert_eq!(r.file.path, regular.path, "{ps} drew from another family's file");
+        assert_eq!((r.weight, r.italic, r.synthetic), (weight, italic, true), "{ps}");
+    }
+}
+
+/// Parsed metrics are the identity check the task asks for: the face's own `upm` and ink extents
+/// reproduce the first-baseline ratios Photoshop measured and stored in the library's
+/// `font_ascent.json` (min of the `H` cap and `d` ascender ink over `upm`).
+#[test]
+fn parsed_metrics_reproduce_photoshop_measured_ratios() {
+    use skrifa::MetadataProvider;
+    use skrifa::raw::FileRef;
+    let Some(index) = photoshop_index_or_skip() else { return };
+    let ratios = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../photocraft/photocraft-text/tests/data/font_ascent.json");
+    let Ok(text) = std::fs::read_to_string(&ratios) else {
+        eprintln!("skipping: {} not present", ratios.display());
+        return;
+    };
+    let ink = |font: &skrifa::FontRef<'_>, ch: char| -> Option<f32> {
+        let gid = font.charmap().map(ch)?;
+        let bounds = font.glyph_metrics(skrifa::instance::Size::unscaled(), skrifa::instance::LocationRef::default()).bounds(gid)?;
+        Some(bounds.y_max)
+    };
+    let mut checked = 0;
+    for line in text.lines() {
+        let Some((name, value)) = line.trim().trim_start_matches('{').trim_end_matches('}').split_once("\": ") else { continue };
+        let name = name.trim_start_matches('"');
+        let Ok(expected) = value.trim_end_matches(',').parse::<f32>() else { continue };
+        let Some(file) = index.resolve(name) else { continue };
+        let Ok(bytes) = std::fs::read(&file.path) else { continue };
+        let Ok(file_ref) = FileRef::new(&bytes) else { continue };
+        let font = match file_ref {
+            FileRef::Font(font) => font,
+            FileRef::Collection(collection) => match collection.get(file.face_index) {
+                Ok(font) => font,
+                Err(_) => continue,
+            },
+        };
+        let upm = f32::from(font.metrics(skrifa::instance::Size::unscaled(), skrifa::instance::LocationRef::default()).units_per_em);
+        let (Some(cap), Some(ascender)) = (ink(&font, 'H'), ink(&font, 'd')) else { continue };
+        let measured = cap.min(ascender) / upm;
+        assert!((measured - expected).abs() <= 0.002, "{name}: parsed {measured:.4}, Photoshop measured {expected:.4}");
+        checked += 1;
+    }
+    assert!(checked >= 10, "only {checked} measured faces could be checked");
+}

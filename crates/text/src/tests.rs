@@ -1270,11 +1270,11 @@ fn build_txt2_writes_paragraph_sheets() {
     assert_eq!(lens, vec![4, 2], "UTF-16 lengths: a+emoji+CR is 4, b+CR is 2");
     assert!(runs[0].path(&["0", "0", "5"]).is_some(), "Photoshop's nested paragraph run: {:?}", runs[0]);
     let sheet = runs[0].path(&["0", "0", "5"]).or_else(|| runs[0].path(&["0", "5"])).expect("paragraph sheet");
-    // Photoshop's paragraph code space is shared by `Txt2` and `EngineData`:
-    // 5 = justify all, 6 = justify-last-left (the same table the reader's
-    // `Justification::from_psd` uses). `JustifyAll` is 5; the pre-migration
-    // writer's `para_align_code` shifted the justified modes by one.
-    assert_eq!(sheet.get("0").and_then(E::as_i64), Some(5), "fully justified");
+    // Photoshop's paragraph code space is shared by `Txt2` and `EngineData`,
+    // measured with the 7-alignment oracle (`out/verify/sync/justify_probe.py`):
+    // 0 left, 1 right, 2 centre, 3 justify-last-left, 4 justify-last-right,
+    // 5 justify-last-centre, 6 justify-all. `JustifyAll` is 6.
+    assert_eq!(sheet.get("0").and_then(E::as_i64), Some(6), "fully justified");
     assert_eq!(sheet.get("1").and_then(E::as_f64), Some(24.0));
     assert_eq!(sheet.get("2").and_then(E::as_f64), Some(12.0));
     assert_eq!(sheet.get("3").and_then(E::as_f64), Some(6.0));

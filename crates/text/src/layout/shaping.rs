@@ -41,6 +41,7 @@ fn adopt_postscript_face(fonts: &mut FontDb, s: &mut CharStyle) {
     let Some(ps) = s.postscript_name.clone() else {
         return;
     };
+    fonts.trace_postscript_use(&ps, &s.font_family);
     if fonts.faces(&s.font_family).iter().any(|f| f.postscript_name.as_deref() == Some(&ps)) {
         return;
     }

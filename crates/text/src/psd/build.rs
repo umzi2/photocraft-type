@@ -76,9 +76,10 @@ pub(crate) fn paragraph_properties(p: &ParagraphStyle, k: f32) -> E {
         TextAlign::JustifyLeft => 3,
         TextAlign::JustifyRight => 4,
         TextAlign::JustifyCenter => 5,
-        // The shared `EngineData`/`Txt2` code space: 5 is fully justified (docs/txt2-map.md),
-        // not the pre-migration writer's shifted 6.
-        TextAlign::JustifyAll => 5,
+        // The shared `EngineData`/`Txt2` code space measured with the 7-alignment
+        // oracle (`out/verify/sync/justify_probe.py`): 3 justify-last-left,
+        // 4 justify-last-right, 5 justify-last-centre, 6 justify-all.
+        TextAlign::JustifyAll => 6,
     };
     let triple = |v: [f32; 3]| E::Array(v.iter().map(|x| real(*x)).collect());
     E::Dict(vec![
@@ -681,9 +682,10 @@ fn para_align_code(a: TextAlign) -> i64 {
         TextAlign::Left => 0,
         TextAlign::Right => 1,
         TextAlign::Center => 2,
-        TextAlign::JustifyLeft | TextAlign::JustifyCenter => 3,
+        TextAlign::JustifyLeft => 3,
         TextAlign::JustifyRight => 4,
-        TextAlign::JustifyAll => 5,
+        TextAlign::JustifyCenter => 5,
+        TextAlign::JustifyAll => 6,
     }
 }
 
@@ -932,6 +934,12 @@ fn run_spec(style: &CharStyle, k: f32) -> photocraft_text_re::psd::RunSpec {
         italic: style.faux_italic,
         underline: style.underline,
         strikethrough: style.strikethrough,
+        // The `Txt2` `/6/15`-`/6/16` style codes are unknown to this adapter:
+        // the underlying model reads them, but the app only carries the legacy
+        // booleans, and deriving a code from a boolean would be a guess
+        // (stroke parity is a documented residual).
+        underline_type: None,
+        strike_type: None,
         all_caps: matches!(style.caps, Caps::AllCaps),
         small_caps: matches!(style.caps, Caps::SmallCaps),
         old_style,
@@ -977,16 +985,17 @@ fn color_rgb(color: &Color) -> [u8; 3] {
 fn paragraph_spec(style: &ParagraphStyle, k: f32) -> photocraft_text_re::psd::ParagraphSpec {
     let unit = |pt: f32| pt / k;
     photocraft_text_re::psd::ParagraphSpec {
-        // The engine's code space is the `EngineData` one (5 = justify all,
-        // 6 = justify last left), not `Txt2` `/5/0`.
+        // The measured code space (`out/verify/sync/justify_probe.py`):
+        // 0 left, 1 right, 2 centre, 3 justify-last-left, 4 justify-last-right,
+        // 5 justify-last-centre, 6 justify-all.
         justification: match style.align {
+            TextAlign::Left => 0,
             TextAlign::Right => 1,
             TextAlign::Center => 2,
-            TextAlign::JustifyCenter => 3,
+            TextAlign::JustifyLeft => 3,
             TextAlign::JustifyRight => 4,
-            TextAlign::JustifyAll => 5,
-            TextAlign::JustifyLeft => 6,
-            TextAlign::Left => 0,
+            TextAlign::JustifyCenter => 5,
+            TextAlign::JustifyAll => 6,
         },
         every_line_composer: style.every_line_composer,
         first_line_indent: unit(style.first_line_indent_pt),

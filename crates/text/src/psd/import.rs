@@ -615,16 +615,16 @@ fn paragraphs_of(spec: &photocraft_text_re::psd::LayerSpec, tysh: &TySh, text: &
 
 fn paragraph_style_of(paragraph: &photocraft_text_re::psd::ParagraphSpec, k: f32) -> ParagraphStyle {
     ParagraphStyle {
-        // The engine's `ParagraphSpec.justification` is the `EngineData`
-        // code space (5 = justify all, 6 = justify last left), not the
-        // `Txt2` `/5/0` one the fork's old writer used.
+        // Measured code space (`out/verify/sync/justify_probe.py`):
+        // 0 left, 1 right, 2 centre, 3 justify-last-left, 4 justify-last-right,
+        // 5 justify-last-centre, 6 justify-all.
         align: match paragraph.justification {
             1 => TextAlign::Right,
             2 => TextAlign::Center,
-            3 => TextAlign::JustifyCenter,
+            3 => TextAlign::JustifyLeft,
             4 => TextAlign::JustifyRight,
-            5 => TextAlign::JustifyAll,
-            6 => TextAlign::JustifyLeft,
+            5 => TextAlign::JustifyCenter,
+            6 => TextAlign::JustifyAll,
             _ => TextAlign::Left,
         },
         first_line_indent_pt: paragraph.first_line_indent * k,

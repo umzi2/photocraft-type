@@ -284,6 +284,32 @@ fn horizontal_glyphs(c: &Convert<'_>, out: &mut TextLayout) {
     out.clusters = clusters(c, &lines, false);
 }
 
+/// The along-column extent of one vertical line: one em cell per drawn glyph, and U+0020's own
+/// advance for a space, matching the library's `column_extent` (measured 2026-11-14: Myriad 24 pt
+/// `"abc def ghi"` recomposes to 215 px, the no-space control to 204 = our rect exactly, and the
+/// space advance is 5.088 px). The engine's vertical advance does not agree with either.
+fn column_along_extent(c: &Convert<'_>, line: &photocraft_text_re::layer_render::TextLine) -> f32 {
+    let mut total = 0.0;
+    for glyph in &c.engine.glyphs {
+        if glyph.range.start < line.range.start || glyph.range.start >= line.range.end {
+            continue;
+        }
+        let ch = c.text.get(glyph.range.clone()).and_then(|s| s.chars().next()).unwrap_or(' ');
+        if ch == ' ' {
+            // Positions and advances are both in text-space pixels here.
+            total += glyph.advance;
+            continue;
+        }
+        let size = c
+            .styles
+            .get(style_index(glyph.run, c.styles.len()) as usize)
+            .map_or(12.0, |style| style.size_pt)
+            * c.px_per_pt;
+        total += size;
+    }
+    total
+}
+
 /// Vertical lines: the engine sets one em column per paragraph line; the editor's line space has
 /// the line direction down (`x`) and the cross-line direction left (`baseline`), so every column
 /// becomes one line whose `baseline` is minus the column's centre x and whose along-axis extent
@@ -295,11 +321,20 @@ fn vertical_lines(c: &Convert<'_>, out: &mut TextLayout) {
     for line in &c.engine.lines {
         let centre = (line.x0 + line.x1) * 0.5;
         let half = ((line.x1 - line.x0) * 0.5).max(size_descent * 0.5);
+        // The along extent Photoshop stores is one em cell per drawn glyph and zero for U+0020
+        // (the library renderer's `column_extent`). The engine's `line.end` counts the font's
+        // vertical advance instead — 0.95 em for Noto Sans — so the cached rect came out short
+        // (205 vs Photoshop's 218 on "abc def ghi" at 24 pt). Derive it from the fixed library
+        // column layout; the cross extent still comes from the engine.
+        let along = column_along_extent(c, line);
+        if std::env::var_os("PHOTOCRAFT_VSPACE_DEBUG").is_some() {
+            eprintln!("vertical_lines: engine end={:.3} along={:.3} glyphs={} range={:?}", line.end, along, c.engine.glyphs.iter().filter(|g| g.range.start >= line.range.start && g.range.start < line.range.end).count(), line.range);
+        }
         out.lines.push(LineInfo {
             range: without_trailing_break(c.text, line.range.clone()),
             baseline: -(ox + centre),
             x0: oy,
-            x1: oy + line.end,
+            x1: oy + along,
             ascent: half,
             descent: half,
             paragraph: line.paragraph,

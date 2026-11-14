@@ -331,7 +331,14 @@ pub fn set_text_gamma(gamma: f32) {
 
 /// The current text blending gamma (see [`set_text_gamma`]; 1 = off).
 pub fn text_gamma() -> f32 {
-    f32::from_bits(TEXT_GAMMA_SETTING.load(std::sync::atomic::Ordering::Relaxed))
+    // Rendering-fidelity experiments (task-17) need the pass switched off
+    // without reaching into the session API: `PHOTOCRAFT_TEXT_GAMMA=1` forces a
+    // gamma for the process, which is why the override is read once and cached.
+    static OVERRIDE: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    let over = *OVERRIDE.get_or_init(|| {
+        std::env::var("PHOTOCRAFT_TEXT_GAMMA").ok().and_then(|v| v.parse::<f32>().ok()).map(|g| if g.is_finite() { g.clamp(1.0, 2.2) } else { TEXT_GAMMA })
+    });
+    over.unwrap_or_else(|| f32::from_bits(TEXT_GAMMA_SETTING.load(std::sync::atomic::Ordering::Relaxed)))
 }
 
 /// Into the text blending space: linear light raised to `1 / gamma`. Gamma 2.2 is close to
@@ -535,5 +542,167 @@ mod tests {
                 assert!((generic[channel] - photoshop[channel]).abs() < 1e-6, "{mode:?} Cb={cb} Cs={cs}: {generic:?} != {photoshop:?}");
             }
         }
+    }
+}
+
+/// A "Blend Text Colors Using Gamma" cross-check measured independently of the
+/// fixtures used to fit the setting (task-17: live type layers, Times New Roman
+/// 48 pt `H`, 7 backgrounds x 16 coverage levels, captured through the Photoshop
+/// oracle). `out` is Photoshop's merged composite; the expected value is the
+/// sRGB-transfer pass at gamma 1.45.
+#[cfg(test)]
+mod measured_text_gamma {
+    use super::*;
+
+    /// `(backdrop, text colour, stored alpha, Photoshop's merged composite)`.
+    const ROWS: &[(u8, u8, u8, u8)] = &[
+        (255, 0, 0, 255),     // bw
+        (255, 0, 17, 244),    // bw
+        (255, 0, 34, 233),    // bw
+        (255, 0, 51, 221),    // bw
+        (255, 0, 68, 209),    // bw
+        (255, 0, 85, 197),    // bw
+        (255, 0, 102, 184),   // bw
+        (255, 0, 119, 170),   // bw
+        (255, 0, 136, 156),   // bw
+        (255, 0, 153, 141),   // bw
+        (255, 0, 170, 125),   // bw
+        (255, 0, 187, 107),   // bw
+        (255, 0, 204, 88),    // bw
+        (255, 0, 221, 66),    // bw
+        (255, 0, 238, 38),    // bw
+        (255, 0, 255, 0),     // bw
+        (0, 128, 0, 0),       // g0_fg128
+        (0, 128, 17, 14),     // g0_fg128
+        (0, 128, 34, 28),     // g0_fg128
+        (0, 128, 51, 40),     // g0_fg128
+        (0, 128, 68, 50),     // g0_fg128
+        (0, 128, 85, 59),     // g0_fg128
+        (0, 128, 102, 68),    // g0_fg128
+        (0, 128, 119, 76),    // g0_fg128
+        (0, 128, 136, 83),    // g0_fg128
+        (0, 128, 153, 90),    // g0_fg128
+        (0, 128, 170, 97),    // g0_fg128
+        (0, 128, 187, 104),   // g0_fg128
+        (0, 128, 204, 110),   // g0_fg128
+        (0, 128, 221, 116),   // g0_fg128
+        (0, 128, 238, 122),   // g0_fg128
+        (0, 128, 255, 128),   // g0_fg128
+        (128, 0, 0, 128),     // g128_fg0
+        (128, 0, 17, 122),    // g128_fg0
+        (128, 0, 34, 116),    // g128_fg0
+        (128, 0, 51, 110),    // g128_fg0
+        (128, 0, 68, 104),    // g128_fg0
+        (128, 0, 85, 97),     // g128_fg0
+        (128, 0, 102, 90),    // g128_fg0
+        (128, 0, 119, 83),    // g128_fg0
+        (128, 0, 136, 76),    // g128_fg0
+        (128, 0, 153, 68),    // g128_fg0
+        (128, 0, 170, 59),    // g128_fg0
+        (128, 0, 187, 50),    // g128_fg0
+        (128, 0, 204, 40),    // g128_fg0
+        (128, 0, 221, 28),    // g128_fg0
+        (128, 0, 238, 14),    // g128_fg0
+        (128, 0, 255, 0),     // g128_fg0
+        (128, 255, 0, 128),   // g128_fg255
+        (128, 255, 17, 138),  // g128_fg255
+        (128, 255, 34, 149),  // g128_fg255
+        (128, 255, 51, 158),  // g128_fg255
+        (128, 255, 68, 167),  // g128_fg255
+        (128, 255, 85, 176),  // g128_fg255
+        (128, 255, 102, 185), // g128_fg255
+        (128, 255, 119, 194), // g128_fg255
+        (128, 255, 136, 202), // g128_fg255
+        (128, 255, 153, 210), // g128_fg255
+        (128, 255, 170, 218), // g128_fg255
+        (128, 255, 187, 226), // g128_fg255
+        (128, 255, 204, 233), // g128_fg255
+        (128, 255, 221, 241), // g128_fg255
+        (128, 255, 238, 248), // g128_fg255
+        (128, 255, 255, 255), // g128_fg255
+        (128, 64, 0, 128),    // g128_fg64
+        (128, 64, 17, 124),   // g128_fg64
+        (128, 64, 34, 121),   // g128_fg64
+        (128, 64, 51, 117),   // g128_fg64
+        (128, 64, 68, 113),   // g128_fg64
+        (128, 64, 85, 109),   // g128_fg64
+        (128, 64, 102, 105),  // g128_fg64
+        (128, 64, 119, 101),  // g128_fg64
+        (128, 64, 136, 97),   // g128_fg64
+        (128, 64, 153, 93),   // g128_fg64
+        (128, 64, 170, 88),   // g128_fg64
+        (128, 64, 187, 84),   // g128_fg64
+        (128, 64, 204, 79),   // g128_fg64
+        (128, 64, 221, 74),   // g128_fg64
+        (128, 64, 238, 69),   // g128_fg64
+        (128, 64, 255, 64),   // g128_fg64
+        (64, 0, 0, 64),       // g64_fg0
+        (64, 0, 17, 61),      // g64_fg0
+        (64, 0, 34, 58),      // g64_fg0
+        (64, 0, 51, 54),      // g64_fg0
+        (64, 0, 68, 51),      // g64_fg0
+        (64, 0, 85, 47),      // g64_fg0
+        (64, 0, 102, 43),     // g64_fg0
+        (64, 0, 119, 39),     // g64_fg0
+        (64, 0, 136, 35),     // g64_fg0
+        (64, 0, 153, 31),     // g64_fg0
+        (64, 0, 170, 26),     // g64_fg0
+        (64, 0, 187, 21),     // g64_fg0
+        (64, 0, 204, 15),     // g64_fg0
+        (64, 0, 221, 9),      // g64_fg0
+        (64, 0, 238, 4),      // g64_fg0
+        (64, 0, 255, 0),      // g64_fg0
+        (0, 255, 0, 0),       // wb
+        (0, 255, 17, 38),     // wb
+        (0, 255, 34, 66),     // wb
+        (0, 255, 51, 88),     // wb
+        (0, 255, 68, 107),    // wb
+        (0, 255, 85, 125),    // wb
+        (0, 255, 102, 141),   // wb
+        (0, 255, 119, 156),   // wb
+        (0, 255, 136, 170),   // wb
+        (0, 255, 153, 184),   // wb
+        (0, 255, 170, 197),   // wb
+        (0, 255, 187, 209),   // wb
+        (0, 255, 204, 221),   // wb
+        (0, 255, 221, 233),   // wb
+        (0, 255, 238, 244),   // wb
+        (0, 255, 255, 255),   // wb
+    ];
+
+    fn plain_linear(bg: f32, fg: f32, c: f32) -> f32 {
+        bg + c * (fg - bg)
+    }
+
+    #[test]
+    fn the_pass_reproduces_independent_photoshop_measurements() {
+        let g = TEXT_GAMMA;
+        let mut sum = 0.0f32;
+        let mut worst = 0i32;
+        let mut linear_sum = 0.0f32;
+        let mut linear_worst = 0i32;
+        for &(bg, fg, alpha, want) in ROWS {
+            let c = f32::from(alpha) / 255.0;
+            let bgv = f32::from(bg) / 255.0;
+            let fgv = f32::from(fg) / 255.0;
+            let src = [fgv, fgv, fgv, c];
+            let dst = [bgv, bgv, bgv, 1.0];
+            let out = composite_gamma(BlendMode::Normal, dst, src, 1.0, g)[0] * 255.0;
+            let err = (out.round() as i32 - i32::from(want)).abs();
+            sum += err as f32;
+            worst = worst.max(err);
+            let lin = plain_linear(bgv, fgv, c) * 255.0;
+            let lerr = (lin.round() as i32 - i32::from(want)).abs();
+            linear_sum += lerr as f32;
+            linear_worst = linear_worst.max(lerr);
+        }
+        let n = ROWS.len() as f32;
+        let (mean, linear_mean) = (sum / n, linear_sum / n);
+        assert!(!ROWS.is_empty());
+        assert!(worst <= 2, "worst {worst}/255 (mean {mean}) over {} rows", ROWS.len());
+        assert!(mean <= 0.5, "mean {mean}/255 (worst {worst})");
+        // A plain mix of the encoded values is what the pass exists to avoid.
+        assert!(linear_worst > 5 * worst, "plain linear {linear_worst} vs pass {worst}");
+        assert!(linear_mean > 5.0 * mean, "plain linear mean {linear_mean} vs pass {mean}");
     }
 }

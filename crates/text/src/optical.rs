@@ -133,10 +133,10 @@ const DEPTH: f32 = 0.04;
 const NEAR: f32 = 0.1;
 /// Fitted coefficients (see the module docs): intercept, closest approach, white space beyond
 /// it, saturated closest approach.
-const C0: f32 = -0.0033;
-const C_MIN: f32 = 0.5384;
-const C_EXCESS: f32 = 0.5526;
-const C_NEAR: f32 = -0.1612;
+const C0: f32 = 0.00078499;
+const C_MIN: f32 = 0.15956334;
+const C_EXCESS: f32 = 0.09602965;
+const C_NEAR: f32 = 0.02511967;
 /// Optical kerning never moves a pair further than this (1/1000 em).
 const LIMIT: f32 = 400.0;
 
@@ -161,14 +161,37 @@ pub fn pair_features(l: &Profile, r: &Profile) -> Option<(f32, f32)> {
     Some((min, excess))
 }
 
-/// Photoshop's optical kerning is looser at small sizes: pairs open by about
-/// 11 × ln(95 / size) thousandths of an em below 95 pt (measured at 12, 24, 48, 96 and 100 pt;
-/// flat below 15 pt here, where the measurements level off).
-pub fn size_adjust(size_pt: f32) -> f32 {
-    if !size_pt.is_finite() || size_pt <= 0.0 {
-        return 0.0;
+/// Photoshop's optical kerning is **not** an em constant: measured against Photoshop's own
+/// recomposition (730 pairs x 10 fonts at 24 pt plus a 20-pair sweep at 8/12/18/24/36/48/72 pt,
+/// `out/verify/sync/optical-targets.md`), the correction per em tightens as the size grows. A
+/// multiplicative per-size scale fits that: the fitted scales are 1.902 at 8 pt, 2.658 at 12,
+/// 2.790 at 18, 2.574 at 24, 3.193 at 36, 3.379 at 48 and 3.782 at 72 pt (per mille rmse 11.7 /
+/// 9.2 / 9.4 / 25.6 / 10.6 / 10.9 / 12.3 against Photoshop, versus 44.5-62.2 for the previous
+/// additive `11 * ln(95 / size)` law). Held at the outer anchors; linear between them.
+pub fn size_scale(size_pt: f32) -> f32 {
+    const SCALES: &[(f32, f32)] = &[
+        (8.0, 1.902),
+        (12.0, 2.658),
+        (18.0, 2.790),
+        (24.0, 2.574),
+        (36.0, 3.193),
+        (48.0, 3.379),
+        (72.0, 3.782),
+    ];
+    if !(size_pt.is_finite() && size_pt > 0.0) {
+        return 1.0;
     }
-    11.0 * (95.0 / size_pt.clamp(15.0, 95.0)).ln()
+    let (first_pt, first) = SCALES[0];
+    if size_pt <= first_pt {
+        return first;
+    }
+    for w in SCALES.windows(2) {
+        let ((p0, s0), (p1, s1)) = (w[0], w[1]);
+        if size_pt <= p1 {
+            return s0 + (s1 - s0) * (size_pt - p0) / (p1 - p0);
+        }
+    }
+    SCALES[SCALES.len() - 1].1
 }
 
 /// Optical kerning (1/1000 em) of a pair with features `f`, for a font whose "oo" pair has
@@ -237,6 +260,34 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fitted constants and the multiplicative size law (see `size_scale`). Pinned so a
+    /// silent edit cannot pass review; the residuals behind them are in
+    /// `out/verify/sync/spacing/fork_fit.py` and `out/verify/sync/optical-targets.md`.
+    #[test]
+    fn optical_constants_are_the_fitted_ones() {
+        assert!((C0 - 0.00078499).abs() < 1e-9);
+        assert!((C_MIN - 0.15956334).abs() < 1e-8);
+        assert!((C_EXCESS - 0.09602965).abs() < 1e-8);
+        assert!((C_NEAR - 0.02511967).abs() < 1e-8);
+        assert_eq!(LIMIT, 400.0);
+        for (size, want) in [
+            (8.0f32, 1.902f32),
+            (12.0, 2.658),
+            (18.0, 2.790),
+            (24.0, 2.574),
+            (36.0, 3.193),
+            (48.0, 3.379),
+            (72.0, 3.782),
+        ] {
+            assert!((size_scale(size) - want).abs() < 1e-3, "size_scale({size} pt)");
+        }
+        // Multiplicative: it tightens as the size grows, and is held outside the anchors.
+        assert!(size_scale(72.0) > size_scale(24.0));
+        assert_eq!(size_scale(4.0), 1.902);
+        assert_eq!(size_scale(144.0), 3.782);
+        assert_eq!(size_scale(f32::NAN), 1.0);
+    }
 
     /// Text set in Photoshop 2026 at 100 pt with Kerning › Optical; `PHOTOSHOP` holds the
     /// kerning Photoshop applied after each character (1/1000 em: optical positions minus the

@@ -183,7 +183,7 @@ fn optical_kern(optical: &mut crate::optical::Cache, st: &CharStyle, a: &KernSlo
     let (l, r) = (a.last?, b.first?);
     let coords: Vec<NormalizedCoord> = a.coords.iter().map(|&c| NormalizedCoord::from_bits(c)).collect();
     let k = optical.pair(a.font.data.id(), a.font.data.as_ref(), a.font.index, &coords, l, r)?;
-    Some(k + crate::optical::size_adjust(st.size_pt))
+    Some(k * crate::optical::size_scale(st.size_pt))
 }
 
 /// One kerning cursor per run on `line`.

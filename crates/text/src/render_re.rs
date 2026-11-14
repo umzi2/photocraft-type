@@ -79,6 +79,31 @@ pub(crate) fn store() -> &'static Mutex<FaceStore> {
 
 fn load_faces() -> FaceStore {
     let mut store = FaceStore::new();
+    // Photoshop's own files, in Photoshop's order (the Wine prefix's `Fonts`, the Adobe
+    // application's PDFL faces, shared Adobe folders, distribution copies): the same list the
+    // name lookup in [`crate::fonts`] uses, so a PSD's `TimesNewRomanPSMT` is drawn from
+    // `times.ttf` and not from a fontconfig substitute. `load_dir` only reads a folder's top
+    // level, so each indexed file is loaded by its stem (`load` = `load_file`).
+    let photoshop = crate::fonts::PsFontIndex::scan();
+    let mut loaded = 0usize;
+    for entry in photoshop.entries() {
+        // The store keys faces by the file's own names; a collection's other faces would share
+        // the file, and the store's parser reads the first face only.
+        if entry.face_index != 0 {
+            continue;
+        }
+        let (Some(dir), Some(stem)) = (entry.path.parent(), entry.path.file_stem().and_then(|s| s.to_str())) else { continue };
+        if store.load(dir, stem).is_ok() {
+            loaded += 1;
+        }
+    }
+    if std::env::var_os("PHOTOCRAFT_FONT_TRACE").is_some_and(|v| !v.is_empty() && v != "0") {
+        eprintln!(
+            "render_re: loaded {loaded} Photoshop faces from {} sources ({} indexed)",
+            photoshop.sources().len(),
+            photoshop.len()
+        );
+    }
     for dir in crate::fonts::system_font_dirs() {
         store.load_dir(&dir);
     }
@@ -120,6 +145,33 @@ fn load_faces() -> FaceStore {
         }
     }
     store
+}
+
+/// Logs the layer's requested PostScript names with the Photoshop file each resolves to
+/// (`PHOTOCRAFT_FONT_TRACE=1`): the per-layer font diagnostic of the parity work.
+fn trace_layer_fonts(layer: &TextLayer) {
+    if !crate::fonts::trace_enabled() {
+        return;
+    }
+    static INDEX: OnceLock<crate::fonts::PsFontIndex> = OnceLock::new();
+    let index = INDEX.get_or_init(crate::fonts::PsFontIndex::scan_all);
+    let excerpt: String = layer.text.chars().take(24).collect();
+    let mut seen = std::collections::HashSet::new();
+    for run in &layer.runs {
+        let Some(ps) = run.style.postscript_name.as_deref() else { continue };
+        if !seen.insert(ps.to_string()) {
+            continue;
+        }
+        match index.resolve(ps) {
+            Some(file) => eprintln!(
+                "photocraft-text: layer {excerpt:?} font {ps:?} -> {} face={} sha256={}",
+                file.path.display(),
+                file.face_index,
+                file.sha256
+            ),
+            None => eprintln!("photocraft-text: layer {excerpt:?} font {ps:?} -> no Photoshop file (substitute drawn)"),
+        }
+    }
 }
 
 /// Where the captured atlases live: `PHOTOCRAFT_ATLAS_DIR`, else `assets/atlas` beside the
@@ -705,6 +757,7 @@ fn warp_inputs(layer: &TextLayer, tx: f32, ty: f32) -> Option<(photocraft_text_r
 /// [`crate::TextEngine::render_layer`] does for its own renderer. The surface has an alpha
 /// channel whatever the document's format, as text layers always keep transparency.
 pub fn render_layer(layer: &TextLayer, dpi: f32, format: PixelFormat) -> Result<(Surface, Rect), Unsupported> {
+    trace_layer_fonts(layer);
     render_layer_with_txt2(layer, dpi, format, None)
 }
 
@@ -726,6 +779,7 @@ pub fn render_layer_into(
     txt2: Option<&[u8]>,
     target: Option<(i32, i32, u32, u32)>,
 ) -> Result<(Surface, Rect), Unsupported> {
+    trace_layer_fonts(layer);
     if format.mode != ColorMode::Rgb {
         return Err(Unsupported(format!("a {:?} document", format.mode)));
     }
@@ -826,16 +880,34 @@ pub fn render_layer_into(
     // right edge, so the layout needs both sides: the width places the columns, the height wraps
     // them.
     let vertical_box = (!matches!(layer.shape, TextShape::Point)).then_some(box_size);
+    // Subpixel phase: Photoshop keeps the fractional pen x and quantizes its glyph
+    // bitmaps to a quarter-pixel grid (`round(frac*4) mod 4`; measured on eight
+    // `H` layers at 48 pt, fractions k/8 — 0.125 and 0.250 render identically,
+    // 0.875 and 0.000 do too, everything else differs; see
+    // out/verify/sync/parity-log.md). Rendering at origin `(0, 0)` and blitting at
+    // `round(anchor)` drops that fraction, so every phase rendered as phase 0.
+    // Hand the fractional part of the anchor to the library and place the ink on
+    // the anchor's integer floor instead; the phase is then baked into the
+    // coverage. Only the x fraction: y snapping is a separate rule (PS keeps
+    // integer baselines here, and the ink rows already match).
+    let (fx, _fy) = (anchor.0 - anchor.0.floor(), anchor.1 - anchor.1.floor());
+    // Scaled, rotated and warped layers take the `RectTarget` paths below, which
+    // place the ink themselves; keep their origin integral so those stay exact.
+    let transformed = affine.is_some();
+    let phase = if transformed || warped { (0.0, 0.0) } else { (fx, 0.0) };
+    if std::env::var("PHOTOCRAFT_PHASE_DBG").is_ok() {
+        eprintln!("render_re: anchor={anchor:?} frac={fx:.4} phase={phase:?} target={:?} transformed={transformed}", target.is_some());
+    }
     let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if vertical {
             match vertical_box {
-                Some(box_size) => layer_render::render_vertical_from_engine_data_in_box(&guard, &ed, &text, (0.0, 0.0), box_size),
-                None => layer_render::render_vertical_from_engine_data(&guard, &ed, &text, (0.0, 0.0)),
+                Some(box_size) => layer_render::render_vertical_from_engine_data_in_box(&guard, &ed, &text, phase, box_size),
+                None => layer_render::render_vertical_from_engine_data(&guard, &ed, &text, phase),
             }
         } else {
-            layer_render::render_from_engine_data_with_paragraphs_and_features(&guard, &ed, &text, &paragraphs, &features, box_size, (0.0, 0.0))
-                .or_else(|_| layer_render::render_from_engine_data_with_paragraphs(&guard, &ed, &text, &paragraphs, box_size, (0.0, 0.0)))
-                .or_else(|_| layer_render::render_from_engine_data(&guard, &ed, &text, box_size, (0.0, 0.0)))
+            layer_render::render_from_engine_data_with_paragraphs_and_features(&guard, &ed, &text, &paragraphs, &features, box_size, phase)
+                .or_else(|_| layer_render::render_from_engine_data_with_paragraphs(&guard, &ed, &text, &paragraphs, box_size, phase))
+                .or_else(|_| layer_render::render_from_engine_data(&guard, &ed, &text, box_size, phase))
         }
     }));
     let pixels = match rendered {
@@ -858,7 +930,9 @@ pub fn render_layer_into(
     // `LayerPixels::offset` is measured from that baseline (vertically) and the text origin
     // (horizontally), the same contract the PSD-rewriting examples use.
     let (anchor_x, anchor_y) = anchor;
-    let (left, top) = (anchor_x + pixels.offset.0, anchor_y + pixels.offset.1);
+    // The phase was consumed by the render origin, so the ink's own offset is
+    // measured from the anchor's floor.
+    let (left, top) = (anchor_x.floor() + pixels.offset.0, anchor_y.floor() + pixels.offset.1);
     if !left.is_finite() || !top.is_finite() {
         return Err(Unsupported("its ink lands at a non-finite position".into()));
     }
@@ -885,6 +959,31 @@ pub fn render_layer_into(
         return Ok((Surface::new(format), Rect::EMPTY));
     }
     let rect = Rect::from_xywh(canvas_x + x0 as i32, canvas_y + y0 as i32, (x1 - x0) as u32, (y1 - y0) as u32);
+
+    // Two-pass export: Photoshop's own composition — and the library example — render the ink
+    // *into* the stored rectangle (`RectTarget`), so re-render through that contract instead of
+    // translating the origin-0 raster. The translation path is where the app's saved layer put
+    // every horizontal continuation line 1 px above the library render: same renderer, but the
+    // frame's effect on the line stepping was lost (out/verify/sync/app-export-path.md).
+    if !vertical && !warped && affine.is_none() && target.is_none() && !rect.is_empty() {
+        let (ox, oy, ow, oh) = (rect.x0, rect.y0, rect.width().max(1), rect.height().max(1));
+        let rect_target = RectTarget { origin: (ox, oy), size: (ow, oh), anchor };
+        let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            layer_render::render_from_engine_data_in_rect_with_features(
+                &guard, &ed, &text, &paragraphs, &features, box_size, (0.0, 0.0), rect_target,
+            )
+        }));
+        if let Ok(Ok(out)) = rendered {
+            if out.width == ow && out.height == oh {
+                let out_rect = Rect::from_xywh(ox, oy, ow, oh);
+                let mut surface = Surface::new(format);
+                surface.write_region_par(out_rect, &rgba_to_samples(&out.rgba, format.channels()));
+                surface.prune();
+                drop(guard);
+                return Ok((surface, out_rect));
+            }
+        }
+    }
 
     // Warped type. Horizontal text bends analytically: the engine maps the glyph outlines
     // through the fitted 4x4 patch and rasterises them in the stored rectangle. Vertical text has
@@ -1207,5 +1306,37 @@ mod tests {
 
         let cmyk = PixelFormat::new(ColorMode::Cmyk, photocraft_color::SampleType::U8, true);
         assert!(render_layer(&label("Hi"), 72.0, cmyk).is_err());
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod font_parity_tests {
+    use super::*;
+
+    /// The pixel renderer must draw the faces Photoshop composes with, not a substitute: every
+    /// name the PSD corpus and the sync matrix store has to be in its `FaceStore`.
+    #[test]
+    fn the_pixel_renderer_loads_every_photoshop_face() {
+        if crate::fonts::PsFontIndex::scan().is_empty() {
+            eprintln!("skipping: no Photoshop font sources on this machine");
+            return;
+        }
+        let store = store().lock().unwrap_or_else(|e| e.into_inner());
+        for ps in [
+            "TimesNewRomanPSMT",
+            "ArialMT",
+            "NotoSans-Regular",
+            "NotoSans-Bold",
+            "NotoSerif-Regular",
+            "MyriadPro-Regular",
+            "MinionPro-Regular",
+            "AdobeHeitiStd-Regular",
+            "CCMeanwhile",
+            "CCGrimNGritty-Regular",
+        ] {
+            assert!(store.face(ps).is_some(), "the renderer has no face for {ps}");
+        }
+        let first = store.first_face().and_then(|f| f.postscript_name().as_deref().map(str::to_string));
+        assert!(first.is_some(), "the store is empty");
     }
 }

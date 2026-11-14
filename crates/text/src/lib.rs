@@ -154,6 +154,7 @@ impl TextEngine {
 
     /// Re-renders `layer.cache` from its model. Returns the document-space rectangle drawn.
     pub fn render_layer(&mut self, layer: &mut TextLayer, dpi: f32, format: PixelFormat) -> photocraft_geom::Rect {
+        trace_layer_fonts(layer);
         let (_, r) = self.render(layer, dpi, format);
         layer.cache = Some(r.surface);
         r.rect
@@ -177,6 +178,36 @@ impl TextEngine {
 }
 
 static SHARED: warm::Warm<std::sync::Mutex<TextEngine>> = warm::Warm::new();
+
+/// Logs every font a layer asks for and the Photoshop file behind it (`PHOTOCRAFT_FONT_TRACE=1`):
+/// the per-layer diagnostic of the font-parity work. The index is built once per process, and only
+/// when tracing is on.
+#[cfg(not(target_arch = "wasm32"))]
+fn trace_layer_fonts(layer: &TextLayer) {
+    use std::sync::OnceLock;
+    if !crate::fonts::trace_enabled() {
+        return;
+    }
+    static INDEX: OnceLock<crate::fonts::PsFontIndex> = OnceLock::new();
+    let index = INDEX.get_or_init(crate::fonts::PsFontIndex::scan_all);
+    let excerpt: String = layer.text.chars().take(24).collect();
+    let mut seen = std::collections::HashSet::new();
+    for run in &layer.runs {
+        let Some(ps) = run.style.postscript_name.as_deref() else { continue };
+        if !seen.insert(ps.to_string()) {
+            continue;
+        }
+        match index.resolve(ps) {
+            Some(file) => eprintln!(
+                "photocraft-text: layer {excerpt:?} font {ps:?} -> {} face={} sha256={}",
+                file.path.display(),
+                file.face_index,
+                file.sha256
+            ),
+            None => eprintln!("photocraft-text: layer {excerpt:?} font {ps:?} -> no Photoshop file (substitute drawn)"),
+        }
+    }
+}
 
 /// Whether [`shared`] scans the installed fonts (native builds, outside tests, unless
 /// `PHOTOCRAFT_NO_SYSTEM_FONTS` is set). Without the scan it is cheap to build.

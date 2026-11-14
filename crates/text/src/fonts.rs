@@ -16,6 +16,11 @@ use parley::fontique::{Blob, Collection, CollectionOptions, FontInfoOverride, Fo
 use skrifa::raw::{FileRef, TableProvider, types::Tag};
 use skrifa::{MetadataProvider, string::StringId};
 
+#[cfg(not(target_arch = "wasm32"))]
+mod ps_fonts;
+#[cfg(not(target_arch = "wasm32"))]
+pub use ps_fonts::{PsFontFile, PsFontIndex, PsFontSource, PsResolution, count_font_files, font_dirs as photoshop_font_dirs, host_font_dirs as photoshop_host_font_dirs, trace_enabled};
+
 /// Family used when a style names no family or an unknown one.
 pub const DEFAULT_FAMILY: &str = "Inter";
 /// Bundled monospace family.
@@ -206,6 +211,10 @@ pub struct FontDb {
     face_aliases: HashMap<(String, usize), String>,
     /// This is the shared engine's database: registrations also move [`shared_generation`].
     shared: bool,
+    /// Photoshop's own font files, by PostScript name (`ps_fonts`); `None` until system fonts are
+    /// loaded, and on the web.
+    #[cfg(not(target_arch = "wasm32"))]
+    ps_index: Option<PsFontIndex>,
 }
 
 impl Default for FontDb {
@@ -228,6 +237,8 @@ impl FontDb {
             traits_cache: HashMap::new(),
             face_aliases: HashMap::new(),
             shared: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            ps_index: None,
         };
         for (_, bytes) in BUNDLED {
             db.register_static_font(bytes.as_slice());
@@ -286,6 +297,26 @@ impl FontDb {
                 if seen.insert(key) {
                     self.fcx.collection.load_fonts_from_paths([path]);
                 }
+            }
+            // The faces Photoshop composes with live in the Wine prefix and the Adobe
+            // application's folders, which the platform scan above may not know (a different
+            // `HOME`, a macOS/Windows host). Register the ones it did not already load, from the
+            // same list the name lookup uses, so the face a PSD names is the face the matcher
+            // picks — and no face is registered twice (#font-parity).
+            self.ps_index = Some(PsFontIndex::scan());
+            let photoshop_faces: Vec<_> = self
+                .ps_index
+                .as_ref()
+                .map(PsFontIndex::files_to_register)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|p| {
+                    let key = p.canonicalize().unwrap_or_else(|_| p.clone());
+                    !seen.contains(&key)
+                })
+                .collect();
+            for path in photoshop_faces {
+                self.fcx.collection.load_fonts_from_paths([path]);
             }
             self.ps_cache.clear();
             self.face_cache.clear();
@@ -605,26 +636,88 @@ impl FontDb {
         None
     }
 
-    /// Finds a face by PostScript name (as stored in PSD files): exact match by reading the
-    /// `name` table of candidate faces, else a heuristic split (`Arial-BoldMT` → Arial, 700).
+    /// Finds a face by PostScript name (as stored in PSD files). Photoshop's own files come first
+    /// (`ps_fonts`): the exact face, or the face of the family the name implies when only another
+    /// style of that family ships (`MyriadPro-BoldIt` is drawn from `MyriadPro-Regular.otf`, as
+    /// Photoshop does). Only a name in none of Photoshop's sources falls back to the heuristic
+    /// split (`Arial-BoldMT` → Arial, 700) and then to whatever family the host aliases it to.
     pub fn resolve_postscript(&mut self, ps: &str) -> ResolvedFont {
         if let Some(Some(r)) = self.ps_cache.get(ps) {
             return r.clone();
         }
         let guess = guess_from_postscript(ps);
-        let exact = self.find_exact(ps, &guess.family);
-        let r = exact.unwrap_or_else(|| {
-            // Keep the guessed family only if we have it; otherwise let fallback pick.
-            let mut g = guess.clone();
-            if !self.has_family(&g.family)
-                && let Some(f) = self.families().into_iter().find(|f| f.replace(' ', "").eq_ignore_ascii_case(&g.family.replace(' ', "")))
-            {
-                g.family = f;
+        let photoshop = self.photoshop_resolution(ps);
+        let r = match &photoshop {
+            Some(res) => ResolvedFont { family: res.file.family.clone(), weight: res.weight, italic: res.italic, exact: true },
+            None => {
+                let exact = self.find_exact(ps, &guess.family);
+                exact.unwrap_or_else(|| {
+                    // Keep the guessed family only if we have it; otherwise let fallback pick.
+                    let mut g = guess.clone();
+                    if !self.has_family(&g.family)
+                        && let Some(f) = self.families().into_iter().find(|f| f.replace(' ', "").eq_ignore_ascii_case(&g.family.replace(' ', "")))
+                    {
+                        g.family = f;
+                    }
+                    g
+                })
             }
-            g
-        });
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        if ps_fonts::trace_enabled() {
+            eprintln!("{}", ps_fonts::trace_line(ps, photoshop.as_ref(), &r));
+        }
         self.ps_cache.insert(ps.to_string(), Some(r.clone()));
         r
+    }
+
+    /// How Photoshop's own sources answer `ps` (exact face, or the family's face when the style
+    /// is synthesised), or `None` when Photoshop has no such name either.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn photoshop_resolution(&self, ps: &str) -> Option<PsResolution> {
+        self.ps_index.as_ref()?.resolve_style(ps)
+    }
+
+    /// The Photoshop font file `ps` resolves to (the exact face, or the family's face when only
+    /// another style of it ships). `None` when Photoshop has no such name either.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn resolve_postscript_file(&self, ps: &str) -> Option<&PsFontFile> {
+        self.ps_index.as_ref()?.resolve(ps)
+    }
+
+    /// Photoshop's font sources this database knows (empty until [`Self::load_system_fonts`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn ps_fonts(&self) -> Option<&PsFontIndex> {
+        self.ps_index.as_ref()
+    }
+
+    /// Logs the face a document's run style draws with (`PHOTOCRAFT_FONT_TRACE=1`): the requested
+    /// PostScript name, the family the style names, and the Photoshop file behind it — one line per
+    /// style per layout, i.e. per layer of the document being composed.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn trace_postscript_use(&self, ps: &str, family: &str) {
+        if !ps_fonts::trace_enabled() {
+            return;
+        }
+        let file = self.ps_index.as_ref().and_then(|i| i.resolve(ps));
+        match file {
+            Some(f) => eprintln!(
+                "photocraft-text: font-use {ps:?} family={family:?} -> {} face={} sha256={}",
+                f.path.display(),
+                f.face_index,
+                f.sha256
+            ),
+            None => eprintln!("photocraft-text: font-use {ps:?} family={family:?} -> no Photoshop file (substituted face)"),
+        }
+    }
+
+    /// The diagnostic table for `names`: requested name → file, face, hash, family/style, and
+    /// whether the style has to be synthesised or the name found no Photoshop face at all. This is
+    /// the per-layer data of `PHOTOCRAFT_FONT_TRACE`, for tooling and tests.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn font_resolution_report(&self, names: &[&str]) -> Vec<ps_fonts::ResolutionRow> {
+        let Some(index) = self.ps_index.as_ref() else { return Vec::new() };
+        names.iter().map(|ps| index.row(ps)).collect()
     }
 
     fn find_exact(&mut self, ps: &str, family_guess: &str) -> Option<ResolvedFont> {
