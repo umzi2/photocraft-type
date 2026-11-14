@@ -469,6 +469,7 @@ fn scaled_advance_deltas(
     text: &str,
     box_size: (f32, f32),
     features: &[RunFeatures],
+    cached: &[f32],
 ) -> Vec<f32> {
     let paragraphs = paragraph_runs(layer, dpi, text);
     let engine_data = |layer: &TextLayer| {
@@ -504,6 +505,13 @@ fn scaled_advance_deltas(
     };
     if live.glyphs.len() != plain.glyphs.len() || live.glyphs.is_empty() {
         return Vec::new();
+    }
+    // The file's own composed cache is Photoshop's text-space composition, so its corrections are
+    // exact where our optical model only approximates them. Scale them like every other text-space
+    // quantity: `cached` is already per glyph and includes the run's tracking, so the document
+    // advance is the nominal one plus `scale x` the cache value.
+    if cached.len() == live.glyphs.len() && cached.iter().any(|d| d.abs() > 1e-6) {
+        return cached.iter().map(|d| scale * d).collect();
     }
     let runs = layer.char_runs();
     let mut out = Vec::with_capacity(live.glyphs.len());
@@ -1023,7 +1031,6 @@ pub fn render_layer_into(
         && optical
         && !vertical
         && !warped
-        && deltas.is_empty()
         && layer.char_runs().len() == 1;
     // The kerning-free copy the native render lays out: the target advances are supplied as the
     // per-glyph corrections, so the engine must not add pair kerning of its own.
@@ -1068,8 +1075,12 @@ pub fn render_layer_into(
             feature.old_style = old_style;
         }
         // `features` are laid out again at `dpi`, so the correction is the text-space composition
-        // minus the kerning-free one, times the transform.
-        deltas = scaled_advance_deltas(&guard, layer, dpi, a, &text, (width, height), &features);
+        // minus the kerning-free one, times the transform. A composed `Txt2` cache is preferred:
+        // those values are Photoshop's own text-space corrections (the `Untitled-15` scaled layers
+        // carry them), and the engine used to add them at the transformed size on top of an
+        // optical correction computed there, which made those layers 1.5-2.4 % narrow.
+        let cached = std::mem::take(&mut deltas);
+        deltas = scaled_advance_deltas(&guard, layer, dpi, a, &text, (width, height), &features, &cached);
     }
     if let Some(first) = features.first_mut() {
         first.advance_deltas = deltas;
