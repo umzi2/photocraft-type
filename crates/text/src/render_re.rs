@@ -835,6 +835,29 @@ pub fn txt2_uses_default_ascent(layer: &TextLayer, txt2: Option<&[u8]>) -> bool 
     layer.orientation == Orientation::Horizontal && matches!(txt2_first_baseline(layer, txt2), Some(photocraft_text_re::area::FirstBaseline::Ascent))
 }
 
+/// Whether an importer should re-compose this layer from the document's `Txt2` block on open.
+///
+/// Horizontal type follows [`txt2_uses_default_ascent`]. Vertical type has no horizontal first
+/// baseline, but Photoshop still composes its columns from the block, so a file whose pixels were
+/// rasterised by an older build keeps a stale cache that disagrees with Photoshop's open view for
+/// that layer too; a current object in the block is what makes the block authoritative.
+pub fn txt2_recomposable(layer: &TextLayer, txt2: Option<&[u8]>) -> bool {
+    if layer.orientation == Orientation::Horizontal {
+        return txt2_uses_default_ascent(layer, txt2);
+    }
+    let Some(block) = txt2 else { return false };
+    if !crate::psd::txt2_is_valid(block) {
+        return false;
+    }
+    let Some(index) = layer.psd_raw.as_deref().and_then(|tysh| crate::psd::text_index(tysh)).and_then(|index| usize::try_from(index).ok()) else {
+        return false;
+    };
+    photocraft_text_re::txt2::object_text(block, index).is_some_and(|stored| {
+        let normalize = |text: &str| text.replace('\r', "\n").trim_end_matches('\n').to_string();
+        normalize(&stored) == normalize(&layer.text)
+    })
+}
+
 /// [`render_layer`], painting into `target` (a document rectangle, `x, y, w, h`) when the layer
 /// already has one — an imported layer's stored pixels keep the document geometry Photoshop gave
 /// them, so re-rendering inside that same rectangle keeps the layer in place instead of moving it

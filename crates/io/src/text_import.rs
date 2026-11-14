@@ -98,7 +98,7 @@ fn recompose_default_ascent(layers: &mut [Layer], dpi: f32, format: photocraft_c
     for l in layers {
         match &mut l.content {
             LayerContent::Text(t) => {
-                if !photocraft_text::render_re::txt2_uses_default_ascent(t, Some(txt2)) {
+                if !photocraft_text::render_re::txt2_recomposable(t, Some(txt2)) {
                     continue;
                 }
                 // `None`: the stored rectangle is the cache's old composition and must not clip
