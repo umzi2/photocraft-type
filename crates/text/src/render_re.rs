@@ -445,6 +445,78 @@ pub(crate) fn advance_deltas(layer: &TextLayer, glyphs: usize, txt2: Option<&[u8
     per_char
 }
 
+/// The per-glyph advance corrections that put a uniformly scaled layer's text-space advances
+/// back on glyphs the engine rasterises at the transformed size.
+///
+/// Photoshop composes transformed type in text space and scales the composition, so a glyph's
+/// advance is the text-space one times the transform. The engine, with the scale folded into the
+/// resolution, lays the glyphs out at the transformed size instead — same glyphs, same ink, but
+/// its optical-kerning pair model (which depends on the em size) picks different corrections.
+/// The correction for each glyph is `tracking + scale * (live advance - kerning-free advance)`,
+/// the quantity [`photocraft_text_re::layer_render::RunFeatures::advance_deltas`] carries: the
+/// layout adds it to the glyph's nominal advance (`Untitled-18.psd`, the 2.4934x layers).
+///
+/// Both advances are measured on the layer's *own* text-space `EngineData` at `dpi`, laid out in
+/// its text-space box: the live document (optical kerning and manual pairs as the layer asks) and
+/// a kerning-free copy of it. The difference is only the automatic pair correction, so tracking
+/// (which both carry) comes back in explicitly. An empty result means the two layouts did not
+/// shape the same glyphs and the layer keeps the engine's own advances.
+fn scaled_advance_deltas(
+    store: &FaceStore,
+    layer: &TextLayer,
+    dpi: f32,
+    scale: f32,
+    text: &str,
+    box_size: (f32, f32),
+    features: &[RunFeatures],
+) -> Vec<f32> {
+    let paragraphs = paragraph_runs(layer, dpi, text);
+    let engine_data = |layer: &TextLayer| {
+        let bytes = crate::engine_data::write(&crate::psd::build_engine_data(layer, None, dpi));
+        engine_data::parse(&bytes).ok()
+    };
+    let mut plain = layer.clone();
+    plain.runs = layer.char_runs();
+    for run in &mut plain.runs {
+        run.style.kerning = Kerning::Off;
+        run.style.kern = 0.0;
+    }
+    let (Some(live_ed), Some(plain_ed)) = (engine_data(layer), engine_data(&plain)) else {
+        return Vec::new();
+    };
+    let mut live_features = features.to_vec();
+    let mut plain_features = features.to_vec();
+    for feature in &mut live_features {
+        feature.optical_kerning = true;
+        feature.advance_deltas.clear();
+    }
+    for feature in &mut plain_features {
+        feature.optical_kerning = false;
+        feature.advance_deltas.clear();
+    }
+    let layout = |ed: &photocraft_text_re::engine_data::Value, features: &[RunFeatures]| {
+        layer_render::layout_from_engine_data_with_paragraphs_and_features(
+            store, ed, text, &paragraphs, features, box_size, (0.0, 0.0),
+        )
+    };
+    let (Ok(live), Ok(plain)) = (layout(&live_ed, &live_features), layout(&plain_ed, &plain_features)) else {
+        return Vec::new();
+    };
+    if live.glyphs.len() != plain.glyphs.len() || live.glyphs.is_empty() {
+        return Vec::new();
+    }
+    let runs = layer.char_runs();
+    let mut out = Vec::with_capacity(live.glyphs.len());
+    for (glyph, plain_glyph) in live.glyphs.iter().zip(&plain.glyphs) {
+        let style = runs.get(glyph.run).or_else(|| runs.last()).map(|run| &run.style);
+        let (size_pt, tracking, hscale) =
+            style.map_or((layer.size_pt, 0.0, 1.0), |s| (s.size_pt, s.tracking, s.horizontal_scale));
+        let size = size_pt * dpi * scale / 72.0;
+        out.push(tracking / 1000.0 * size * hscale + scale * (glyph.advance - plain_glyph.advance));
+    }
+    out
+}
+
 /// Reads the composed cache's per-glyph spacing values in composed order.
 ///
 /// ```text
@@ -909,14 +981,70 @@ pub fn render_layer_into(
         return Ok((Surface::new(format), Rect::EMPTY));
     }
 
-    // The exporter's own writer: the reimplementation lays out exactly the document a saved
-    // PSD would carry, and the model's paragraph sheets are passed beside it so its own
-    // `Txt2` values stay authoritative.
-    let engine_data_bytes = crate::engine_data::write(&crate::psd::build_engine_data(layer, None, render_dpi));
-    let ed = engine_data::parse(&engine_data_bytes).map_err(|e| Unsupported(format!("its EngineData does not parse: {e}")))?;
+    // Photoshop composes a transformed type layer in *text space* and only then scales the
+    // result, so a layer's glyph advances are the text-space ones times the transform. The
+    // engine's optical-kerning model is size dependent, though: with the scale folded into
+    // `render_dpi` it lays the glyphs out at the transformed size and closes pairs by the
+    // transformed size's target gap, which is a different correction. Measured on
+    // `Untitled-18.psd` (`out/verify/psd-offset-untitled15.md`): the two 2.4934x layers came out
+    // 7 px and 10 px narrow against Photoshop's recompose while the 1.0 layer was exact, and the
+    // glyph ink boxes themselves already matched. So render the glyphs at the transformed size
+    // but put the text-space advances back, as the per-glyph corrections the layout applies on
+    // top of each glyph's nominal advance.
+    //
+    // The target is the layer's own text-space composition at `dpi`; the correction is its
+    // advance minus the kerning-free advance, which is the quantity `advance_deltas` carries.
+    // The native render uses a kerning-free `EngineData` so that the optical-vs-uniform branch
+    // `apply_advances` picks cannot change the base the correction lands on (nominal and actual
+    // advance are then the same). Layers with a composed `Txt2` cache keep their own path: those
+    // corrections are Photoshop's text-space values already.
     // `EngineData` stores paragraph ends as CR, the model uses LF.
     let text = layer.text.replace('\n', "\r");
     let paragraphs = paragraph_runs(layer, render_dpi, &text);
+    let composer = paragraphs.iter().any(|p| p.every_line_composer);
+    // The composed cache carries Photoshop's own optical corrections when the layer came from a
+    // PSD; a fresh or edited layer has no such cache and its model runs say the mode directly.
+    let optical = cache_is_optical(layer, txt2) || model_is_optical(layer);
+    // Optical kerning's pair corrections live in the cache exactly like the composer's nudges,
+    // and the engine tells them apart by their size and variation (a large, varying correction is
+    // optical and replaces the metrics advance; a uniform tiny one is tracking/composer). Passing
+    // them needs the same alignment as the composer deltas.
+    let mut deltas = if (composer || optical) && std::env::var_os("PHOTOCRAFT_ADVANCES").is_none_or(|v| v != "0") {
+        advance_deltas(layer, text.encode_utf16().count() + 2, txt2)
+    } else {
+        Vec::new()
+    };
+    let vertical = layer.orientation != Orientation::Horizontal;
+    // Only layers whose optical corrections are not already in a composed `Txt2` cache are
+    // re-expressed from text space, and only one-run layers: the kerning-free copy carries the
+    // model's run sheets, and a multi-run layer's per-run kerning modes could move them.
+    let text_space_advances = uniform_scale
+        && (a - 1.0).abs() > 1e-4
+        && optical
+        && !vertical
+        && !warped
+        && deltas.is_empty()
+        && layer.char_runs().len() == 1;
+    // The kerning-free copy the native render lays out: the target advances are supplied as the
+    // per-glyph corrections, so the engine must not add pair kerning of its own.
+    let plain_layer = text_space_advances.then(|| {
+        let mut plain = layer.clone();
+        plain.runs = layer.char_runs();
+        for run in &mut plain.runs {
+            run.style.kerning = Kerning::Off;
+            run.style.kern = 0.0;
+        }
+        plain
+    });
+    // The exporter's own writer: the reimplementation lays out exactly the document a saved
+    // PSD would carry, and the model's paragraph sheets are passed beside it so its own
+    // `Txt2` values stay authoritative.
+    let engine_data_bytes = crate::engine_data::write(&crate::psd::build_engine_data(
+        plain_layer.as_ref().unwrap_or(layer),
+        None,
+        render_dpi,
+    ));
+    let ed = engine_data::parse(&engine_data_bytes).map_err(|e| Unsupported(format!("its EngineData does not parse: {e}")))?;
 
     let guard = store().lock().unwrap_or_else(|e| e.into_inner());
     let atlas_count = guard.atlases().len();
@@ -926,28 +1054,26 @@ pub fn render_layer_into(
     // a panic during layout is caught and the layer falls back like any other refusal.
     let style_runs = photocraft_text_re::runs::from_engine_data(&ed).len();
     let mut features = run_features(layer, style_runs, txt2);
-    let composer = paragraphs.iter().any(|p| p.every_line_composer);
-    // The composed cache carries Photoshop's own optical corrections when the layer came from a
-    // PSD; a fresh or edited layer has no such cache and its model runs say the mode directly.
-    let optical = cache_is_optical(layer, txt2) || model_is_optical(layer);
-    // Optical kerning's pair corrections live in the cache exactly like the composer's nudges,
-    // and the engine tells them apart by their size and variation (a large, varying correction is
-    // optical and replaces the metrics advance; a uniform tiny one is tracking/composer). Passing
-    // them needs the same alignment as the composer deltas.
-    let deltas = if (composer || optical) && std::env::var_os("PHOTOCRAFT_ADVANCES").is_none_or(|v| v != "0") {
-        advance_deltas(layer, text.encode_utf16().count() + 2, txt2)
-    } else {
-        Vec::new()
-    };
-    if let Some(first) = features.first_mut() {
-        first.advance_deltas = deltas;
-    }
-    if optical {
+    if !text_space_advances && optical {
         for feature in &mut features {
             feature.optical_kerning = true;
         }
     }
-    let vertical = layer.orientation != Orientation::Horizontal;
+    if text_space_advances {
+        // The kerning-free copy's first character still carries `AutoKerning`, so the encoder can
+        // split it into more style runs than the model's one. The model's single run sheet must
+        // keep describing every character: carry its `Txt2` old-style setting across the split.
+        let old_style = features.first().is_some_and(|feature| feature.old_style);
+        for feature in &mut features {
+            feature.old_style = old_style;
+        }
+        // `features` are laid out again at `dpi`, so the correction is the text-space composition
+        // minus the kerning-free one, times the transform.
+        deltas = scaled_advance_deltas(&guard, layer, dpi, a, &text, (width, height), &features);
+    }
+    if let Some(first) = features.first_mut() {
+        first.advance_deltas = deltas;
+    }
     let baseline_kind = if vertical { None } else { txt2_first_baseline(layer, txt2) };
     let (ascender_ratio, first_baseline) = match baseline_kind {
         Some(kind) => (
@@ -1001,9 +1127,6 @@ pub fn render_layer_into(
     // place the ink themselves; keep their origin integral so those stay exact.
     let transformed = affine.is_some();
     let phase = if transformed || warped { (0.0, 0.0) } else { (fx, 0.0) };
-    if std::env::var("PHOTOCRAFT_PHASE_DBG").is_ok() {
-        eprintln!("render_re: anchor={anchor:?} frac={fx:.4} phase={phase:?} target={:?} transformed={transformed}", target.is_some());
-    }
     let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if vertical {
             match vertical_box {
