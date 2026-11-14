@@ -823,6 +823,18 @@ fn txt2_first_baseline(
     }
 }
 
+/// Whether Photoshop composes this layer with the `Txt2` frame's default **Ascent** first
+/// baseline, i.e. [`render_layer_into`] would drop the rectangle its stored pixels carry.
+///
+/// A file importer uses it to tell that the pixels a file came with were composed by a build
+/// that used the cap-height rule for every frame: those are stale for such a layer and an open
+/// must re-compose it, as the recompose command (`type.updateAllTextLayers`) already does.
+/// Vertical type takes no horizontal first baseline, so it is never re-composed for this rule
+/// (the renderer picks the same branch).
+pub fn txt2_uses_default_ascent(layer: &TextLayer, txt2: Option<&[u8]>) -> bool {
+    layer.orientation == Orientation::Horizontal && matches!(txt2_first_baseline(layer, txt2), Some(photocraft_text_re::area::FirstBaseline::Ascent))
+}
+
 /// [`render_layer`], painting into `target` (a document rectangle, `x, y, w, h`) when the layer
 /// already has one — an imported layer's stored pixels keep the document geometry Photoshop gave
 /// them, so re-rendering inside that same rectangle keeps the layer in place instead of moving it
