@@ -17,7 +17,8 @@ use serde_json::{Value, json};
 
 use crate::commands::{CommandSpec, explicit_layer, layer_param};
 use crate::type_cmds::{
-    check_text_unlocked, format_targets, has_format_target, is_auto_named, layer_name, refresh_at, replace_text, style_paragraphs, style_range, typed_name,
+    check_text_unlocked, format_targets, has_format_target, is_auto_named, layer_name, refresh_at,
+    refresh_at_with_txt2, replace_text, style_paragraphs, style_range, txt2_block, typed_name,
     with_text_targets,
 };
 use crate::{EngineError, Result, Session};
@@ -842,10 +843,15 @@ fn update_all(s: &mut Session) -> Result<Value> {
     let mut n = 0;
     s.edit("Update All Text Layers", |doc, _| {
         let (dpi, format) = (doc.resolution_dpi, doc.pixel_format());
+        // The document's `Txt2` is what Photoshop composes from, and its frames
+        // choose the first baseline (`Untitled-16.psd`: no `/2 /10`, so Ascent).
+        // Read it before the mutable layer walk; rendering without it composes
+        // with the engine default and disagrees with Photoshop by 1-3 px.
+        let txt2 = txt2_block(doc);
         let ids: Vec<LayerId> = doc.walk().into_iter().filter(|(_, _, l)| matches!(l.content, LayerContent::Text(_))).map(|(_, _, l)| l.id).collect();
         for id in ids {
             if let Some(Layer { content: LayerContent::Text(t), .. }) = doc.layer_mut(id) {
-                refresh_at(dpi, format, t);
+                refresh_at_with_txt2(dpi, format, t, txt2.as_deref().map(Vec::as_slice));
                 n += 1;
             }
         }

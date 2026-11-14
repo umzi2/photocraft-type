@@ -767,6 +767,62 @@ pub fn render_layer_with_txt2(layer: &TextLayer, dpi: f32, format: PixelFormat, 
     render_layer_into(layer, dpi, format, txt2, None)
 }
 
+/// Photoshop's First baseline choice for a horizontal box/area layer, when the
+/// document's `Txt2` block is one Photoshop composes from.
+///
+/// Photoshop places area text's first line by the frame's First baseline
+/// (`Txt2` `/0 /8 /0 [frame] /0 /2 /10 /0`): the record absent (or `1`) means
+/// **Ascent** — the ink top of `d`, `0.69499 * size` for Times — while `2`
+/// means **Cap Height**, what the engine used for every layer before this
+/// choice was read. A file written by a PhotoCraft build that left the record
+/// out is therefore composed 1-3 px lower by Photoshop than by the app (the
+/// user's `Untitled-16.psd`; `out/verify/untitled16/`), and that is the offset
+/// reported here.
+///
+/// The choice applies only while the block is current: `Txt2` validity is the
+/// same scaffolding test the importer uses, and a layer whose object still
+/// holds another text (a stale block) would be composed by Photoshop from
+/// `TySh`, so `None` keeps the engine's cap-height rule there. A layer the
+/// block has no current object for is left to the default too: the save writes
+/// it a frame without the record, which Photoshop composes as Ascent, so the
+/// default is returned once the block itself is valid.
+fn txt2_first_baseline(
+    layer: &TextLayer,
+    txt2: Option<&[u8]>,
+) -> Option<photocraft_text_re::area::FirstBaseline> {
+    use photocraft_text_re::area::FirstBaseline;
+    if matches!(layer.shape, TextShape::Point) {
+        return None;
+    }
+    let block = txt2?;
+    if !crate::psd::txt2_is_valid(block) {
+        return None;
+    }
+    let object = layer
+        .psd_raw
+        .as_deref()
+        .and_then(|tysh| crate::psd::text_index(tysh))
+        .and_then(|index| usize::try_from(index).ok());
+    let current = object.is_some_and(|object| {
+        photocraft_text_re::txt2::object_text(block, object).is_some_and(|stored| {
+            let normalize = |text: &str| {
+                text.replace('\r', "\n").trim_end_matches('\n').to_string()
+            };
+            normalize(&stored) == normalize(&layer.text)
+        })
+    });
+    if current {
+        match object.and_then(|object| photocraft_text_re::txt2::object_first_baseline(block, object)) {
+            Some(FirstBaseline::CapHeight) => Some(FirstBaseline::CapHeight),
+            _ => Some(FirstBaseline::Ascent),
+        }
+    } else {
+        // The save writes this layer a frame without `/2 /10`, Photoshop's
+        // default Ascent.
+        Some(FirstBaseline::Ascent)
+    }
+}
+
 /// [`render_layer`], painting into `target` (a document rectangle, `x, y, w, h`) when the layer
 /// already has one — an imported layer's stored pixels keep the document geometry Photoshop gave
 /// them, so re-rendering inside that same rectangle keeps the layer in place instead of moving it
@@ -856,8 +912,23 @@ pub fn render_layer_into(
             feature.optical_kerning = true;
         }
     }
-    let first_baseline = layer_render::first_baseline_offset_of(&guard, &ed).unwrap_or(0.0);
     let vertical = layer.orientation != Orientation::Horizontal;
+    let baseline_kind = if vertical { None } else { txt2_first_baseline(layer, txt2) };
+    let (ascender_ratio, first_baseline) = match baseline_kind {
+        Some(kind) => (
+            layer_render::first_baseline_ratio_of_kind(&guard, &ed, kind),
+            layer_render::first_baseline_offset_of_kind(&guard, &ed, kind).unwrap_or(0.0),
+        ),
+        None => (None, layer_render::first_baseline_offset_of(&guard, &ed).unwrap_or(0.0)),
+    };
+    // A layer composed with Photoshop's default Ascent was not composed by the rectangle
+    // the cache carries (the app's old cap-height composition made it), so re-rendering
+    // inside that rectangle would clip the lower line rows. Photoshop's own recompose moves
+    // the layer, and so does this one: the ink defines the rectangle.
+    let target = match baseline_kind {
+        Some(photocraft_text_re::area::FirstBaseline::Ascent) => None,
+        _ => target,
+    };
     // `first_baseline` comes from the `EngineData` built at `render_dpi`, so it is already in
     // document pixels; only the text-space box origin is scaled. Point text is anchored at its
     // text origin (its first baseline) and a horizontal box at its top-left plus the first
@@ -905,7 +976,7 @@ pub fn render_layer_into(
                 None => layer_render::render_vertical_from_engine_data(&guard, &ed, &text, phase),
             }
         } else {
-            layer_render::render_from_engine_data_with_paragraphs_and_features(&guard, &ed, &text, &paragraphs, &features, box_size, phase)
+            layer_render::render_from_engine_data_with_paragraphs_and_features_baseline(&guard, &ed, &text, &paragraphs, &features, box_size, phase, ascender_ratio)
                 .or_else(|_| layer_render::render_from_engine_data_with_paragraphs(&guard, &ed, &text, &paragraphs, box_size, phase))
                 .or_else(|_| layer_render::render_from_engine_data(&guard, &ed, &text, box_size, phase))
         }
@@ -969,8 +1040,9 @@ pub fn render_layer_into(
         let (ox, oy, ow, oh) = (rect.x0, rect.y0, rect.width().max(1), rect.height().max(1));
         let rect_target = RectTarget { origin: (ox, oy), size: (ow, oh), anchor };
         let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            layer_render::render_from_engine_data_in_rect_with_features(
+            layer_render::render_from_engine_data_in_rect_with_features_baseline(
                 &guard, &ed, &text, &paragraphs, &features, box_size, (0.0, 0.0), rect_target,
+                ascender_ratio,
             )
         }));
         if let Ok(Ok(out)) = rendered {
@@ -1086,7 +1158,7 @@ pub fn render_layer_into(
                     // blank layer (the user's u12 layers lost their text after an edit).
                     layer_render::render_vertical_from_engine_data_in_rect(&guard, &ed, &text, (0.0, 0.0), vertical_box, rect_target)
                 } else {
-                    layer_render::render_from_engine_data_in_rect_with_features(&guard, &ed, &text, &paragraphs, &features, box_size, (0.0, 0.0), rect_target)
+                    layer_render::render_from_engine_data_in_rect_with_features_baseline(&guard, &ed, &text, &paragraphs, &features, box_size, (0.0, 0.0), rect_target, ascender_ratio)
                 }
             }));
             if let Ok(Ok(pixels)) = again {
