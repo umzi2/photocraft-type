@@ -1,0 +1,21 @@
+font NotoSans-Bold
+size 30.0
+aa 1
+bold 0
+italic 0
+hscale 1.0
+pen_x 40.0
+baseline_y 120.0
+phase 0.25
+bin atlas.bin
+glyph 0025 1 -22 26 23 0 %
+glyph 0030 1 -22 16 23 598 0
+glyph 0034 1 -22 17 22 966 4
+glyph 0035 2 -22 15 23 1340 5
+glyph 0041 0 -22 22 22 1685 A
+glyph 0057 0 -22 30 22 2169 W
+glyph 0061 1 -17 16 18 2829 a
+glyph 0063 2 -17 14 18 3117 c
+glyph 0068 2 -23 16 23 3369 h
+glyph 0070 2 -17 16 25 3737 p
+glyph 0072 2 -17 12 17 4137 r

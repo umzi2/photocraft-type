@@ -75,10 +75,9 @@ fn frame(doc: &Document, id: LayerId, cmd: &str) -> Result<Frame> {
     let transform = t.transform;
     let ink = t.cache.as_ref().map(|c| c.content_bounds()).filter(|r| !r.is_empty());
     let dpi = doc.resolution_dpi;
-    let layout = {
-        let mut eng = photocraft_text::shared().lock().unwrap_or_else(|e| e.into_inner());
-        eng.layout(t, dpi)
-    };
+    // The caret must describe the pixels: use the layout the layer is drawn with, not a second
+    // engine's idea of it.
+    let layout = photocraft_text::layer_layout(t, dpi, doc.pixel_format());
     Ok(Frame { id, text, transform, ink, layout })
 }
 

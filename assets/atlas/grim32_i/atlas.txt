@@ -1,0 +1,10 @@
+font CCGrimNGritty-Regular
+size 32
+aa 1
+bold 0
+italic 0
+hscale 1
+pen_x 40
+baseline_y 120
+bin atlas.bin
+glyph 0069 1 -24 6 24 0 gid=00FC

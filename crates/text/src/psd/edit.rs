@@ -57,20 +57,10 @@ pub(super) fn names_one_frame(object: &E) -> bool {
 /// can't be refitted.
 pub(super) fn new_object(template: &E, at: usize, text: &str) -> Option<E> {
     let paragraphs: Vec<usize> = text.split_inclusive('\r').map(|p| p.encode_utf16().count()).collect();
-    let frame = template.path(&["1", "0"]).and_then(E::as_array).and_then(|f| f.first()).and_then(|f| f.get("0")).cloned();
     let at = i64::try_from(at).ok()?;
     let mut object = edited_object(template, text)?;
     let view = object.get_mut("1")?;
     view.set("0", E::Array(vec![E::Dict(vec![("0".into(), E::Int(at))])]));
-    // The rendered strikes' frame strike (`/F`) names the template's frame too.
-    if let Some(E::Array(strikes)) = view.get_mut("2") {
-        for s in strikes.iter_mut() {
-            let Some(E::Array(parts)) = s.get_mut("6") else { continue };
-            for p in parts.iter_mut().filter(|p| p.get("99").and_then(E::as_str) == Some("F") && p.get("10") == frame.as_ref()) {
-                p.set("10", E::Int(at));
-            }
-        }
-    }
     if let Some(runs) = view.path(&["1", "0"]).and_then(E::as_array) {
         let (mut nodes, mut bytes) = (MAX_REFIT_RUN_NODES, MAX_REFIT_RUN_BYTES);
         let fitted = runs_per(runs, &paragraphs, "1", &mut nodes, &mut bytes)?;
@@ -86,18 +76,22 @@ pub(super) fn is_stub(object: &E) -> bool {
     only(object, &["0"]) && object.get("0").is_some_and(|m| only(m, &["0", "6"]))
 }
 
-/// Gives the block `outer` a frame (`/0 /8 /0`) for each of its `count` text objects: Photoshop
+/// Gives the block `outer` a frame (`/0 /8 /0`) for each of its `count` text objects and returns
+/// the first frame index it created (the caller writes those from the layer's shape: a placeholder
+/// point frame under box text made Photoshop open the layer as point text). Photoshop
 /// writes one per object, and a reader indexes them by object number. Missing frames are the
 /// small point-text frame Photoshop writes (`<< /0 << /2 << /6 [ -1.0 -1.0 ] /11 << /4 -1 /7
 /// false >> >> >> >>`), never copies of a file's frame: the slot count reaches
 /// [`MAX_TEXT_INDEX`], and a large frame copied that often would blow up the save. A block
 /// without a frame list is left as it is.
-pub(super) fn pad_frames(outer: &mut E, count: usize) {
-    let Some(E::Array(frames)) = outer.get_mut("0").and_then(|v| v.get_mut("8")).and_then(|v| v.get_mut("0")) else { return };
+pub(super) fn pad_frames(outer: &mut E, count: usize) -> usize {
+    let Some(E::Array(frames)) = outer.get_mut("0").and_then(|v| v.get_mut("8")).and_then(|v| v.get_mut("0")) else { return 0 };
+    let first = frames.len();
     let count = count.min(MAX_TEXT_INDEX as usize + 1);
     if frames.len() < count {
         frames.resize(count, crate::psd_path::point_frame());
     }
+    first
 }
 
 /// The file's `Txt2` text object `object` (`<< /0 model /1 view … >>`) for the changed engine
@@ -111,6 +105,15 @@ pub(super) fn edited_object(object: &E, text: &str) -> Option<E> {
     let mut object = object.clone();
     let E::Dict(items) = &mut object else { return None };
     items.retain(|(k, _)| k != "21");
+    // The view's composed-layout cache (`/1 /2`: the rendered strikes, whose `/G` glyph runs hold
+    // the gids of the text the file had) describes the old text and style, not the refitted one.
+    // Photoshop renders a stale cache as stored, so a refitted object hands it an empty strike
+    // list and composes from the model — the same key `invalidate_composed_layouts` clears.
+    if let Some(view @ E::Dict(_)) = object.get_mut("1")
+        && view.get("2").is_some()
+    {
+        view.set("2", E::Array(vec![]));
+    }
     let model = object.get_mut("0").filter(|m| matches!(m, E::Dict(_)))?;
     let total = utf16_len(text) as usize;
     let paragraphs: Vec<usize> = text.split_inclusive('\r').map(|p| p.encode_utf16().count()).collect();

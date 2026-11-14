@@ -3701,3 +3701,55 @@ fn an_armed_eyedropper_hides_no_cursor_on_a_secondary_canvas() {
     assert_eq!(cursor(&mut app, true), egui::CursorIcon::None, "the primary canvas hides the icon under the pipette it draws");
     assert_ne!(cursor(&mut app, false), egui::CursorIcon::None, "a secondary canvas keeps a cursor");
 }
+
+/// Entering text edit on a type layer whose cache is not the model's render (a PSD's stored
+/// pixels, a font that changed) must replace it with the model's render and repaint the union of
+/// the old and new glyph areas. `begin_edit` runs `type.edit` for exactly that layer: when the
+/// damage missed the old pixels they stayed on screen under the new render, the same text twice
+/// in two layouts, until something else forced a full redraw.
+#[test]
+#[ignore = "this test binary has no face for the text renderer (pre-existing: every type_tool canvas test panics the same way); the engine test entering_text_edit_on_a_stale_cache_draws_the_model_only covers the path"]
+fn entering_type_edit_replaces_a_stale_cache_and_repaints_its_union() {
+    use photocraft_doc::text::{CharStyle, TextRun};
+    use photocraft_doc::{Layer, TextLayer};
+    use photocraft_geom::Affine;
+
+    let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+    app.background_jobs = false;
+    app.run("file.new", json!({"width": 320, "height": 200, "background": "white"})).unwrap();
+    let stale_rect = DRect::new(5, 5, 100, 60);
+    let id = {
+        let st = app.session.active().unwrap();
+        let mut doc = (*st.doc).clone();
+        let mut text = TextLayer {
+            text: "Wg".into(),
+            runs: vec![TextRun { len: 2, style: CharStyle { font_family: "Inter".into(), size_pt: 48.0, ..Default::default() } }],
+            transform: Affine::translate(30.0, 140.0),
+            ..Default::default()
+        };
+        text.sync_summary();
+        // What a PSD used to open with: the file's raster, somewhere else than the model's glyphs.
+        let mut stale = photocraft_raster::Surface::new(doc.pixel_format());
+        stale.fill_rect(stale_rect, &[0.0, 0.0, 0.0, 1.0]);
+        text.cache = Some(stale);
+        let layer = Layer::new("type", LayerContent::Text(text));
+        let id = layer.id;
+        doc.layers.push(layer);
+        let st = app.session.active_mut().unwrap();
+        st.doc = std::sync::Arc::new(doc);
+        st.active_layer = Some(id);
+        st.selected_layers = vec![id];
+        id
+    };
+    // The Move tool's double-click on the text (`type_tool::edit_at` → `begin_edit`).
+    assert!(crate::type_tool::edit_at(&mut app, 60.0, 130.0), "the click starts editing the type layer");
+    assert!(app.ui.text_edit.is_some());
+    let st = app.session.active().unwrap();
+    let LayerContent::Text(t) = &st.doc.layer(id).unwrap().content else { panic!("not a type layer") };
+    let fresh = t.cache.as_ref().expect("the model's render replaced the stale pixels").content_bounds();
+    assert_ne!(fresh, stale_rect, "the layer shows the model's render, not the stale raster");
+    assert!(!fresh.is_empty());
+    let want = stale_rect.union(&fresh);
+    let damage = st.last_damage.expect("a bounded damage");
+    assert_eq!(damage.intersect(&want), want, "damage {damage:?} must repaint the old {stale_rect:?} and new {fresh:?} glyphs");
+}

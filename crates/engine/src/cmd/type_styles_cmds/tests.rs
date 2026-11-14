@@ -118,11 +118,29 @@ fn paragraph_styles_and_basic_paragraph() {
     assert_eq!((run_at(&t, 0).size_pt, run_at(&t, 0).weight), (24.0, 700));
     assert_eq!(run_at(&t, 5).size_pt, 12.0);
     // Redefining Basic Paragraph moves the second paragraph only.
-    s.execute("type.paragraphStyle.set", json!({"id": 0, "attrs": {"spaceBefore": 6}})).unwrap();
+    s.execute(
+        "type.paragraphStyle.set",
+        json!({"id": 0, "attrs": {
+            "spaceBefore": 6,
+            "hangingPunctuation": true,
+            "composer": "everyLine",
+            "hyphenate": true,
+            "hyphenateWordsLongerThan": 8,
+            "wordSpacing": [0.7, 0.9, 1.2],
+        }}),
+    )
+    .unwrap();
     let t = layer(&s, id);
     let p = t.paragraph_runs();
     assert_eq!(p.last().unwrap().style.space_before_pt, 6.0);
     assert_eq!(p[0].style.space_before_pt, 6.0, "Head inherits Basic Paragraph for unset attributes");
+    // The paragraph-panel depth is style-attribute data like any other: friendly keys reach the
+    // style sheet and resolve to both paragraphs.
+    for st in [&p[0].style, &p.last().unwrap().style] {
+        assert!(st.hanging_punctuation && st.every_line_composer && st.hyphenate);
+        assert_eq!(st.hyphenate_word_size, 8);
+        assert_eq!(st.justification_word, [0.7, 0.9, 1.2]);
+    }
     // Basic Paragraph can't be deleted or renamed; bad ids and attributes are rejected.
     assert!(s.execute("type.paragraphStyle.delete", json!({"id": 0})).is_err());
     assert!(s.execute("type.paragraphStyle.rename", json!({"id": 0, "name": "x"})).is_err());

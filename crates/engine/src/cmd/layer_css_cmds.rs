@@ -25,8 +25,8 @@
 //! custom paths), which get the rule of their box.
 
 use std::collections::HashMap;
-use std::sync::PoisonError;
 
+use photocraft_color::PixelFormat;
 use photocraft_doc::text::{Orientation, TextAlign, TextShape};
 use photocraft_doc::{Document, Fill, Layer, LayerContent, LayerId, LiveShape, Path, TextLayer};
 use photocraft_geom::{Point, Rect};
@@ -163,19 +163,26 @@ pub fn place_point_text(pix: Rect, ink: [f64; 4], baseline: f64, cap: f64, size_
 /// [`place_point_text`] for a type layer, from its layout; `None` (placed at its pixels) when
 /// there is nothing to measure: no pixels or ink, no font, or type that is turned, scaled,
 /// warped or vertical.
-fn point_text_origin(t: &TextLayer, pix: Rect, dpi: f32, family: &str, size_pt: f32, line_height: f64) -> Option<Point> {
+fn point_text_origin(t: &TextLayer, pix: Rect, dpi: f32, format: PixelFormat, family: &str, size_pt: f32, line_height: f64) -> Option<Point> {
     let [a, b, c, d, _, _] = t.transform.m;
     if pix.is_empty() || a != 1.0 || b != 0.0 || c != 0.0 || d != 1.0 || t.warp.is_some() || t.orientation != Orientation::Horizontal {
         return None;
     }
     let size_px = f64::from(size_pt) * f64::from(dpi) / 72.0;
     let cap_layer = TextLayer { text: "H".into(), font_family: family.into(), size_pt, ..Default::default() };
-    let mut eng = photocraft_text::shared().lock().unwrap_or_else(PoisonError::into_inner);
-    let layout = eng.layout(t, dpi);
-    let ink = photocraft_text::render::ink_bounds(&layout)?;
+    let layout = photocraft_text::layer_layout(t, dpi, format);
     let baseline = f64::from(layout.lines.first()?.baseline);
-    let cap_layout = eng.layout(&cap_layer, dpi);
-    let cap = f64::from(cap_layout.lines.first()?.baseline) - photocraft_text::render::ink_bounds(&cap_layout)?[1];
+    // The ink is the engine's own: the rectangle it draws the layer into, moved back from the
+    // layer transform into text space (the linear part is the identity, checked above).
+    let (_, ink_rect) = photocraft_text::render_re::render_layer(t, dpi, format).ok()?;
+    if ink_rect.is_empty() {
+        return None;
+    }
+    let [_, _, _, _, tx, ty] = t.transform.m;
+    let ink = [f64::from(ink_rect.x0) - tx, f64::from(ink_rect.y0) - ty, f64::from(ink_rect.x1) - tx, f64::from(ink_rect.y1) - ty];
+    let cap_layout = photocraft_text::layer_layout(&cap_layer, dpi, format);
+    let (_, cap_rect) = photocraft_text::render_re::render_layer(&cap_layer, dpi, format).ok()?;
+    let cap = f64::from(cap_layout.lines.first()?.baseline) - f64::from(cap_rect.y0);
     // Photoshop works with the line height it writes, three decimals of the size.
     let line_height_px = (line_height * 1000.0).round() / 1000.0 * size_px;
     let at = place_point_text(pix, ink, baseline, cap, size_px, line_height_px);
@@ -238,7 +245,7 @@ pub fn rule(doc: &Document, z: usize, l: &Layer) -> Option<String> {
                 // Point text has no box of its own: only its position.
                 _ => {
                     sized = false;
-                    origin = point_text_origin(t, bounds, doc.resolution_dpi.max(1.0), family, size_pt, line_height);
+                    origin = point_text_origin(t, bounds, doc.resolution_dpi.max(1.0), doc.pixel_format(), family, size_pt, line_height);
                 }
             }
         }

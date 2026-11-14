@@ -530,9 +530,30 @@ fn retargeting_type_survives_bad_resolutions() {
         LayerContent::Text(t) => t.size_pt,
         _ => panic!("not type"),
     };
+    let zone = |d: &Document| match &d.layers[0].content {
+        LayerContent::Text(t) => t.paragraph_runs()[0].style.hyphenation_zone_pt,
+        _ => panic!("not type"),
+    };
     d.resolution_dpi = 72.0;
     crate::canvas_geom::retarget_type_resolution(&mut d, 72.0);
     assert_eq!(size(&d), 24.0);
+    assert_eq!(zone(&d), 36.0);
+    // An explicitly set zone is a point measurement and scales like the indents.
+    if let LayerContent::Text(t) = &mut d.layers[0].content {
+        t.paragraphs = vec![photocraft_doc::text::ParagraphRun {
+            style: photocraft_doc::text::ParagraphStyle { hyphenation_zone_pt: 18.0, ..Default::default() },
+            len: 1,
+        }];
+    }
+    crate::canvas_geom::retarget_type_resolution(&mut d, 300.0);
+    assert!(close(zone(&d), 4.32), "{}", zone(&d));
+    d.resolution_dpi = 72.0;
+    crate::canvas_geom::retarget_type_resolution(&mut d, 72.0);
+    assert_eq!(zone(&d), 4.32);
+    if let LayerContent::Text(t) = &mut d.layers[0].content {
+        t.paragraphs.clear();
+        t.size_pt = 24.0;
+    }
     for bad in [0.0, -5.0, f32::NAN, f32::INFINITY] {
         crate::canvas_geom::retarget_type_resolution(&mut d, bad);
         assert_eq!(size(&d), 24.0, "{bad}");
@@ -544,8 +565,10 @@ fn retargeting_type_survives_bad_resolutions() {
     d.resolution_dpi = f32::MAX;
     crate::canvas_geom::retarget_type_resolution(&mut d, f32::MIN_POSITIVE);
     assert!(size(&d).is_finite() && size(&d) > 0.0, "{}", size(&d));
+    assert!(zone(&d).is_finite() && zone(&d) > 0.0, "{}", zone(&d));
     crate::canvas_geom::retarget_type_resolution(&mut d, f32::MAX);
     assert!(size(&d).is_finite() && size(&d) > 0.0, "{}", size(&d));
+    assert!(zone(&d).is_finite() && zone(&d) > 0.0, "{}", zone(&d));
 }
 
 /// Document 0 at 72 ppi with "Hello" in Paragraph Style 1 (24 pt) and "He" also in Character

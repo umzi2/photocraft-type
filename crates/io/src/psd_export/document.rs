@@ -192,13 +192,42 @@ fn export_supported_document(
             _ => None,
         })
         .collect();
-    let previous = (!text_layers.is_empty()).then(|| preserved.iter().find(|(_, key, _)| key == b"Txt2").map(|(_, _, data)| data.to_vec())).flatten();
-    // A fresh document of ordinary (Metrics) text with no Txt2-only OpenType settings has nothing
-    // to put in `Txt2`, and Photoshop never writes its empty `<< /0 << >> >>` stub — readers such
-    // as Photopea reject it (#3514). Keep the block when the file had one (round-trip its pen
-    // positions/extras), a layer is Optical (#1348), or a layer carries stylistic sets / other
-    // Txt2-only features (#10308).
-    let txt2 = (previous.is_some() || photocraft_text::psd::needs_txt2(&text_layers))
+    // A preserved block is a template for the regenerated one, but the layer blocks it came
+    // with can contradict the model: an older build wrote `Hrzn` on vertical text, so the file's
+    // `Txt2` objects describe layers whose `Ornt` disagrees with their engine data. Reusing that
+    // template carries the contradiction into the save (Photoshop refuses it), and the engine
+    // data lets Photoshop rebuild the block on open, so a document with such a layer starts the
+    // `Txt2` from nothing instead.
+    let stale_orientation = text_layers.iter().any(|(_, t)| {
+        t.psd_raw.as_deref().and_then(|d| photocraft_text::psd::tysh_orientation(d)).is_some_and(|o| o != t.orientation)
+    });
+    let previous = (!text_layers.is_empty() && !stale_orientation)
+        .then(|| preserved.iter().find(|(_, key, _)| key == b"Txt2").map(|(_, _, data)| data.to_vec()))
+        .flatten();
+    // Keep the block when the file had one (round-trip its pen positions/extras and its paragraph
+    // sheets), and write one for a PhotoCraft-native document that has something only `Txt2` can
+    // say: Optical kerning, a Txt2-only OpenType setting, or type on a path (#1348, #10308).
+    // A plain Metrics document with none of those omits the block: Photoshop never writes its
+    // empty `<< /0 << >> >>` stub and readers such as Photopea reject it (#3514).
+    // The block's composed-layout cache (`/1/1[i]/1`) still draws the glyphs of an older model:
+    // Photoshop renders it as stored, so a save that changed text, styles or paragraph properties
+    // without rewriting the cache shows the old layout (and asks before the first text edit).
+    // Invalidate the cache of every object whose model differs from the block being replaced, so
+    // Photoshop recomposes those layers while opening while an untouched layer keeps its object
+    // (Photoshop's glyph pen positions included). The text logic lives in the reimplemented engine
+    // crate, this exporter only calls it.
+    // Every save with type layers writes the block (see `photocraft_text::psd::build_txt2_at`):
+    // a native or unrepairable block starts from Photoshop's own `/98` + `/0` + `/1` scaffolding,
+    // because a block with only a frame list and an object array is refused at open with "General
+    // Photoshop error" (and asks to update the text layers). Omitting the block for a plain
+    // Metrics document was the old workaround for the empty stub we used to write; the block now
+    // carries the whole scaffolding, so it is written for every type layer.
+    // A plain Metrics document with nothing `Txt2`-only to say omits the block (#3514: Photoshop
+    // never writes its empty stub, and readers such as Photopea reject it). Vertical type always
+    // writes one: its text flow is marked in the `Txt2` frame (`/2 /1 2`), and without the block
+    // Photoshop opens the layer as horizontal text.
+    let vertical = text_layers.iter().any(|(_, t)| t.orientation == photocraft_doc::text::Orientation::Vertical);
+    let txt2 = (previous.is_some() || vertical || photocraft_text::psd::needs_txt2(&text_layers))
         .then(|| photocraft_text::psd::build_txt2_at(&text_layers, previous.as_deref(), ex.dpi));
     for (sig, key, data) in preserved {
         // With no type layers left the opened file's `Txt2` describes text that is gone (fonts and

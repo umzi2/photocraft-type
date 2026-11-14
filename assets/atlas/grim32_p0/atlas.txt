@@ -1,0 +1,23 @@
+font CCGrimNGritty-Regular
+size 32.0
+aa 1
+bold 0
+italic 0
+hscale 1.0
+pen_x 40.0
+baseline_y 120.0
+phase 0.0
+bin atlas.bin
+glyph 0030 1 -25 24 25 0
+glyph 0031 0 -26 21 27 600
+glyph 0032 0 -25 20 25 1167
+glyph 0033 -1 -25 22 26 1667
+glyph 0043 1 -26 25 27 2239
+glyph 0047 1 -25 27 26 2914
+glyph 004E 2 -25 20 27 3616
+glyph 0066 2 -26 19 28 4156
+glyph 006C 2 -25 17 27 4688
+glyph 006D -1 -25 31 26 5147
+glyph 0072 2 -25 22 27 5953
+glyph 0074 0 -25 22 26 6547
+glyph 0079 1 -26 23 28 7119

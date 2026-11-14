@@ -10,6 +10,10 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+# The reimplemented Photoshop text engine (outside this repository) owns the text logic this
+# crate used to duplicate: the `Txt2` composed-layout cache invalidation now lives there and the
+# app only adapts it to its document model. Keep new text-serialization behaviour in that crate.
+photocraft-text-re = { path = "../../../../photocraft/photocraft-text", package = "photocraft-text" }
 photocraft-geom = { workspace = true }
 photocraft-color = { workspace = true }
 photocraft-raster = { workspace = true }

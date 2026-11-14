@@ -24,6 +24,9 @@ pub struct TypePanelsUi {
     pub glyphs: bool,
     /// Style Options editor open for (paragraph?, id).
     pub options: Option<(bool, u32)>,
+    /// Paragraph panel tab: 0 Indents & Spacing, 1 Hyphenation, 2 Justification, 3 Composer.
+    /// Photoshop keeps these groups in the panel's flyout menu; tabs show them at once.
+    pub paragraph_tab: usize,
     /// Glyphs: font family and style ("" = follow the type selection), "Show" category, cell
     /// size in points of UI, recently used glyphs (most recent first).
     pub glyph_family: String,
@@ -460,7 +463,24 @@ fn options_editor(app: &mut PhotocraftApp, ui: &mut egui::Ui, paragraph: bool, s
                 (tl!("Indent Right"), "end_indent_pt", "pt"),
                 (tl!("Space Before"), "space_before_pt", "pt"),
                 (tl!("Space After"), "space_after_pt", "pt"),
-                // Hyphenate is stored and round-trips to PSD, but layout never hyphenates (#6710).
+                (tl!("Auto Leading"), "auto_leading", "num"),
+                // Paragraph-panel depth Photoshop stores in `Txt2`/`EngineData` (see
+                // `docs/txt2-map.md`): valid style attributes even where the on-canvas
+                // composer has no dictionaries (#6710) — Photoshop hyphenates the saved PSD.
+                (tl!("Hyphenate"), "hyphenate", "bool"),
+                (tl!("Words Longer Than"), "hyphenate_word_size", "int"),
+                (tl!("After First"), "hyphenate_min_before", "int"),
+                (tl!("Before Last"), "hyphenate_min_after", "int"),
+                (tl!("Hyphen Limit"), "hyphen_limit", "int"),
+                (tl!("Hyphenation Zone"), "hyphenation_zone_pt", "pt"),
+                (tl!("Hyphenate Capitalized Words"), "hyphenate_capitalized", "bool"),
+                (tl!("Hanging Punctuation"), "hanging_punctuation", "bool"),
+                (tl!("Every-line Composer"), "every_line_composer", "bool"),
+                (tl!("Burasagari"), "burasagari", "bool"),
+                (tl!("Kinsoku Shori"), "kinsoku_order", "kinsoku"),
+                (tl!("Word Spacing"), "justification_word", "tripleW"),
+                (tl!("Letter Spacing"), "justification_letter", "tripleL"),
+                (tl!("Glyph Scaling"), "justification_glyph", "tripleG"),
             ];
             for &(label, key, kind) in rows {
                 let mut on = defined(&para_attrs, key);
@@ -496,6 +516,45 @@ fn options_editor(app: &mut PhotocraftApp, ui: &mut egui::Ui, paragraph: bool, s
                             .changed()
                         {
                             set = Some(json!({ key: x / type_unit }));
+                        }
+                    }
+                    "int" => {
+                        let mut x = v.as_u64().unwrap_or(0) as f32;
+                        if crate::widgets::value_field(ui, &mut x, 0.0..=1000.0, "", 70.0).accessible_name(tl!(&label)).changed() {
+                            set = Some(json!({ key: x.round() as u64 }));
+                        }
+                    }
+                    "tripleW" | "tripleL" | "tripleG" => {
+                        let (min, max) = match kind {
+                            "tripleL" => (-100.0, 1000.0),
+                            "tripleG" => (1.0, 1000.0),
+                            _ => (0.0, 1000.0),
+                        };
+                        let mut t = [1.0f32, 1.0, 1.0];
+                        if let Some(a) = v.as_array() {
+                            for (slot, x) in t.iter_mut().zip(a) {
+                                *slot = x.as_f64().unwrap_or(1.0) as f32;
+                            }
+                        }
+                        let mut changed = false;
+                        ui.horizontal(|ui| {
+                            for slot in &mut t {
+                                let mut x = *slot * 100.0;
+                                if crate::widgets::value_field(ui, &mut x, min..=max, "%", 46.0).changed() {
+                                    *slot = x / 100.0;
+                                    changed = true;
+                                }
+                            }
+                        });
+                        if changed {
+                            set = Some(json!({ key: t }));
+                        }
+                    }
+                    "kinsoku" => {
+                        let mut k = v.as_u64().unwrap_or(0).min(2);
+                        let opts = [(0u64, "Push In"), (1, "Push Out First"), (2, "Push Out Only")];
+                        if crate::widgets::dropdown(ui, &format!("style-kinsoku-{paragraph}-{id}"), tl!(&label), &mut k, &opts, 110.0) {
+                            set = Some(json!({ key: k }));
                         }
                     }
                     _ => {
@@ -1124,8 +1183,9 @@ mod tests {
     }
 
     #[test]
-    fn hyphenate_is_not_shown_in_paragraph_style_options() {
-        // #6710: layout never hyphenates; the style editor must not advertise it.
+    fn paragraph_depth_is_shown_in_paragraph_style_options() {
+        // #6710: the on-canvas composer has no hyphenation dictionary, but the attributes are
+        // valid PSD style data (Photoshop hyphenates the saved file), so the editor shows them.
         use egui_kittest::kittest::Queryable;
         let mut app = app_with_text("Hi");
         app.ui.type_panels.styles = true;
@@ -1141,6 +1201,8 @@ mod tests {
         );
         PhotocraftApp::setup_context(&h.ctx, Default::default());
         h.run_steps(4);
-        assert!(h.query_by_label("Hyphenate").is_none());
+        for label in ["Hyphenate", "Hanging Punctuation", "Every-line Composer", "Hyphenation Zone", "Word Spacing"] {
+            assert!(h.query_all_by_label(label).count() > 0, "the paragraph style editor shows {label}");
+        }
     }
 }

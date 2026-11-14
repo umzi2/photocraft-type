@@ -225,16 +225,40 @@ impl TextLayout {
 
     fn hit_test_x_on_line(&self, line_index: usize, x: f32) -> usize {
         let Some(line) = self.lines.get(line_index) else { return 0 };
-        let mut best = (f32::MAX, line.range.end);
+        // (distance, is the stop's *start*, byte). A stop's start is the caret before it and
+        // its end the caret after it; at an exact boundary both are 0 away.
+        let mut best: Option<(f32, bool, usize)> = None;
         for c in self.clusters.iter().filter(|c| c.line == line_index) {
             let mid = c.x + c.advance / 2.0;
             let (before, after) = if c.rtl { (c.range.end, c.range.start) } else { (c.range.start, c.range.end) };
-            let (dist, off) = if x < mid { ((x - c.x).abs(), before) } else { ((x - c.x - c.advance).abs(), after) };
-            if dist < best.0 {
-                best = (dist, off);
+            // `x <= c.x` covers the zero-advance stop whose midpoint *is* its start (a space
+            // dropped at a wrap boundary, a ligature component at the ligature's end): the
+            // caret at that pen is the stop's start, not the byte after it.
+            let (dist, start, off) = if x <= c.x || x < mid { ((x - c.x).abs(), true, before) } else { ((x - c.x - c.advance).abs(), false, after) };
+            let better = match best {
+                None => true,
+                Some((best_dist, best_start, best_off)) => {
+                    if dist < best_dist {
+                        true
+                    } else if dist > best_dist {
+                        false
+                    } else if start != best_start {
+                        // A stop's start beats the previous stop's end: a ligature's swallowed
+                        // component ends exactly where the next character starts, and the caret
+                        // at that point belongs to the next character; a space dropped at a
+                        // wrap boundary must not steal the caret either.
+                        start
+                    } else {
+                        // Same kind of stop at the same pen: the later one owns the boundary.
+                        off > best_off
+                    }
+                }
+            };
+            if better {
+                best = Some((dist, start, off));
             }
         }
-        best.1
+        best.map_or(line.range.end, |(_, _, off)| off)
     }
 
     /// The caret for a byte offset as a text-space segment (its two end points).

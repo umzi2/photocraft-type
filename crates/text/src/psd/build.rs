@@ -1,8 +1,9 @@
 use super::edit::{TEMPLATE_NODES, edited_object, fits, is_stub, names_one_frame, new_object, pad_frames, td_edited_object, with_modes};
-use super::import::{OPENTYPE_KEYS, TXT2_FEATURES, TXT2_STYLISTIC_SETS, kern_units, manual, object_frame, pair_runs, parse_txt2, postscript_for, real};
+use super::import::{OPENTYPE_KEYS, TXT2_FEATURES, TXT2_STYLISTIC_SETS, kern_units, manual, object_frame, parse_txt2, postscript_for, real};
+
 use super::{
-    AntiAlias, Caps, CharStyle, Color, ColorMode, D, Descriptor, E, FontBaseline, Id, Kerning, Orientation, ParagraphStyle, TextAlign, TextLayer, TextShape,
-    TySh, UnicodeString, ed, engine_data, enum_value, enumv, parse_tysh, write_tysh,
+    AntiAlias, Caps, CharStyle, Color, ColorMode, D, Descriptor, E, FontBaseline, Kerning, Orientation, ParagraphStyle, TextAlign, TextLayer, TextShape, ed,
+    enum_value, enumv,
 };
 
 /// A fill colour as EngineData and `Txt2` store it: the colour type (0 gray, 1 RGB, 2 CMYK) and
@@ -75,8 +76,11 @@ pub(crate) fn paragraph_properties(p: &ParagraphStyle, k: f32) -> E {
         TextAlign::JustifyLeft => 3,
         TextAlign::JustifyRight => 4,
         TextAlign::JustifyCenter => 5,
-        TextAlign::JustifyAll => 6,
+        // The shared `EngineData`/`Txt2` code space: 5 is fully justified (docs/txt2-map.md),
+        // not the pre-migration writer's shifted 6.
+        TextAlign::JustifyAll => 5,
     };
+    let triple = |v: [f32; 3]| E::Array(v.iter().map(|x| real(*x)).collect());
     E::Dict(vec![
         ("Justification".into(), E::Int(j)),
         ("FirstLineIndent".into(), real(p.first_line_indent_pt / k)),
@@ -87,6 +91,20 @@ pub(crate) fn paragraph_properties(p: &ParagraphStyle, k: f32) -> E {
         ("AutoHyphenate".into(), E::Bool(p.hyphenate)),
         ("AutoLeading".into(), real(p.auto_leading)),
         ("LeadingType".into(), E::Int(0)),
+        // Paragraph-panel depth: the model of Photoshop's `ParagraphSheet` (`docs/txt2-map.md`,
+        // `docs/cooltype-re.md`). `Txt2` mirrors these in the paragraph sheet (`/5`).
+        ("Hanging".into(), E::Bool(p.hanging_punctuation)),
+        ("Burasagari".into(), E::Bool(p.burasagari)),
+        ("KinsokuOrder".into(), E::Int(i64::from(p.kinsoku_order))),
+        ("EveryLineComposer".into(), E::Bool(p.every_line_composer)),
+        ("HyphenatedWordSize".into(), E::Int(i64::from(p.hyphenate_word_size))),
+        ("PreHyphen".into(), E::Int(i64::from(p.hyphenate_min_before))),
+        ("PostHyphen".into(), E::Int(i64::from(p.hyphenate_min_after))),
+        ("ConsecutiveHyphens".into(), E::Int(i64::from(p.hyphen_limit))),
+        ("Zone".into(), real(p.hyphenation_zone_pt / k)),
+        ("WordSpacing".into(), triple(p.justification_word)),
+        ("LetterSpacing".into(), triple(p.justification_letter)),
+        ("GlyphSpacing".into(), triple(p.justification_glyph)),
     ])
 }
 
@@ -220,6 +238,10 @@ fn txt2_style_runs(layer: &TextLayer, base: &E, fonts: &mut Vec<E>, dpi: f32, se
         let s = runs.get(ri).map_or(&default, |r| &r.style);
         let font = *looked_up.entry(postscript_for(s)).or_insert_with_key(|name| txt2_font(fonts, name, seed_empty));
         let mut run = base.clone();
+        let inner = run.get_mut("0")?.get_mut("0")?;
+        if inner.get("5").is_none() {
+            inner.set("5", E::Int(1));
+        }
         let style = run.get_mut("0")?.get_mut("0")?.get_mut("6")?;
         if let Some(font) = font {
             style.set("0", E::Int(font));
@@ -611,7 +633,10 @@ fn simple_paint_dict() -> E {
 /// empty `/53` SimplePaint dict so the fill colour can be written.
 fn minimal_txt2_style_run() -> E {
     let style = E::Dict(vec![("0".into(), E::Int(0)), ("11".into(), E::Int(1)), ("53".into(), simple_paint_dict())]);
-    let data = E::Dict(vec![("0".into(), E::String(String::new())), ("6".into(), style)]);
+    // Photoshop's style-run wrapper: `/0 << /0 (name) /5 1 /6 <sheet> >>`. The `/5 1` marks the
+    // run as a character run; a wrapper without it is not a style run Photoshop's composer
+    // reads, and the object then composes with the shared default sheet (12 pt black).
+    let data = E::Dict(vec![("0".into(), E::String(String::new())), ("5".into(), E::Int(1)), ("6".into(), style)]);
     E::Dict(vec![("0".into(), E::Dict(vec![("0".into(), data)])), ("1".into(), E::Int(1))])
 }
 
@@ -620,12 +645,23 @@ fn minimal_txt2_style_run() -> E {
 /// by [`txt2_style_runs`] next.
 fn fresh_point_text_object(frame: usize, text: &str) -> E {
     let frame = i64::try_from(frame).unwrap_or(0);
-    let view = E::Dict(vec![("0".into(), E::Array(vec![E::Dict(vec![("0".into(), E::Int(frame))])]))]);
+    // `/2 [ ]` marks the composed-layout cache as deliberately absent ("not laid out"):
+    // Photoshop recomposes such an object from its model. An object without the marker is
+    // not recomposed from `/0` — it falls back to the shared default character sheet
+    // (`/1/2`: 12 pt, black), which is the "wrong size/colour on edit" bug.
+    let view = E::Dict(vec![
+        ("0".into(), E::Array(vec![E::Dict(vec![("0".into(), E::Int(frame))])])),
+        ("2".into(), E::Array(vec![])),
+    ]);
     // One paragraph run per `\r`-terminated paragraph (lengths in UTF-16 code units), as
     // `edited_object` refits them.
     let paragraphs = text
         .split_inclusive('\r')
-        .map(|p| E::Dict(vec![("0".into(), E::dict()), ("1".into(), E::Int(i64::try_from(p.encode_utf16().count()).unwrap_or(i64::MAX)))]))
+        .map(|p| {
+            // Photoshop's nested paragraph run; the sheet is filled when the object is written.
+            let data = E::Dict(vec![("0".into(), E::String(String::new()))]);
+            E::Dict(vec![("0".into(), E::Dict(vec![("0".into(), data)])), ("1".into(), E::Int(i64::try_from(p.encode_utf16().count()).unwrap_or(i64::MAX)))])
+        })
         .collect();
     let model = E::Dict(vec![
         ("0".into(), E::String(text.to_string())),
@@ -635,33 +671,503 @@ fn fresh_point_text_object(frame: usize, text: &str) -> E {
     E::Dict(vec![("0".into(), model), ("1".into(), view)])
 }
 
-/// The document's `Txt2` block for `objects`: `(TextIndex, layer)` pairs, one text object each
-/// at the slot its `TextIndex` names (see [`set_text_index`] and [`text_index`]; unused slots are
-/// empty dictionaries), carrying the automatic kerning mode of every pair (`/11`: 0 manual,
-/// 1 metrics, 2 optical) — the one thing EngineData can't say (`AutoKerning true` covers Metrics
-/// and Optical alike). PSD export writes this block for the type layers it writes `TySh` data
-/// for; [`apply_txt2`] reads it back. Numbers outside `0..=`[`MAX_TEXT_INDEX`] are skipped: the
-/// slot array is sized by real text objects, never by a file's numbers.
+/// Justification code a `Txt2` paragraph sheet stores in `/5/0`, the code space `EngineData`
+/// shares (docs/txt2-map.md): 0 left, 1 right, 2 centre, 3 justify last centre, 4 justify last
+/// right, 5 fully justified (which stretches the last line too). Photoshop has no code for
+/// "justify last left"; the nearest is 3. The pre-migration writer shifted the justified modes by
+/// one, which read back as another alignment.
+fn para_align_code(a: TextAlign) -> i64 {
+    match a {
+        TextAlign::Left => 0,
+        TextAlign::Right => 1,
+        TextAlign::Center => 2,
+        TextAlign::JustifyLeft | TextAlign::JustifyCenter => 3,
+        TextAlign::JustifyRight => 4,
+        TextAlign::JustifyAll => 5,
+    }
+}
+
+/// Inserts or replaces one key of a `Txt2` paragraph sheet, keeping Photoshop's own key order.
+fn para_key(items: &mut Vec<(String, E)>, key: &str, value: E) {
+    match items.iter_mut().find(|(k, _)| k == key) {
+        Some(slot) => slot.1 = value,
+        None => items.push((key.to_string(), value)),
+    }
+}
+
+/// A `Txt2` paragraph sheet (`/1/1[i]/0/5/0[p]/0/0/5`) for `p`.
 ///
-/// `previous` is the block this replaces (the file's own). A kept object — one whose text is
-/// unchanged — keeps everything the file held beyond the two regenerated keys (its model's text
-/// and style runs): Photoshop stores glyph pen positions under `/21 /1` there, and a save with
-/// no text edit must not drop them. Its own style runs keep every style key too: only their
-/// auto-kern mode is set (split where a mode changes inside a run). An edited object — the
-/// file's object at that slot, its text changed — keeps the object too, with its text replaced
-/// and its run arrays refitted to the new text (#6968: a bare stub crashed Photoshop); only its
-/// glyph pen positions, which belong to the old text, are dropped. Everything
-/// else the file's block held — the other keys beside the text objects, objects no layer names —
-/// is kept, and a block whose content comes out unchanged is returned byte for byte (#2374:
-/// Photoshop refused files whose `Txt2` an unedited save had stripped).
+/// `Txt2` is what Photoshop's composer reads back (`docs/txt2-map.md`): paragraph indents,
+/// spacing, justification and the hyphenation numbers must be written here as well as into
+/// `EngineData`, or Photoshop opens the file with the engine defaults and warns that the stored
+/// layout will change. `base` is the file's own sheet: its unknown keys (`/24`, `/25`, `/33`,
+/// `/35`, `/40`, the CJK sets) are kept byte for byte, our keys are overwritten. Hyphenation
+/// parameters (`/10`…`/15`) are only written when hyphenation is on, as Photoshop does.
+fn txt2_para_sheet(p: &ParagraphStyle, base: Option<&E>) -> E {
+    let mut items = match base {
+        Some(E::Dict(items)) => items.clone(),
+        _ => Vec::new(),
+    };
+    para_key(&mut items, "0", E::Int(para_align_code(p.align)));
+    for (key, value) in [
+        ("1", p.first_line_indent_pt),
+        ("2", p.start_indent_pt),
+        ("3", p.end_indent_pt),
+        ("4", p.space_before_pt),
+        ("5", p.space_after_pt),
+        ("7", p.auto_leading),
+    ] {
+        para_key(&mut items, key, real(value));
+    }
+    if base.is_none() {
+        para_key(&mut items, "8", E::Int(0));
+    }
+    para_key(&mut items, "9", E::Bool(p.hyphenate));
+    if p.hyphenate {
+        // `/10` stores the engine value; the DOM shows it as `hyphenateWordsLongerThan`
+        // (`docs/txt2-map.md` §3: DOM 6 was written as `/10 7`).
+        para_key(&mut items, "10", E::Int(i64::from(p.hyphenate_word_size)));
+        para_key(&mut items, "11", E::Int(i64::from(p.hyphenate_min_before)));
+        para_key(&mut items, "12", E::Int(i64::from(p.hyphenate_min_after)));
+        para_key(&mut items, "13", E::Int(i64::from(p.hyphen_limit)));
+        para_key(&mut items, "14", real(p.hyphenation_zone_pt));
+        para_key(&mut items, "15", E::Bool(p.hyphenate_capitalized));
+    }
+    for (key, values) in [("17", p.justification_word), ("18", p.justification_letter), ("19", p.justification_glyph)] {
+        para_key(&mut items, key, E::Array(values.iter().map(|v| real(*v)).collect()));
+    }
+    para_key(&mut items, "21", E::Bool(p.hanging_punctuation));
+    para_key(&mut items, "29", E::Bool(p.every_line_composer));
+    if base.is_none() {
+        // Photoshop's own run sheet carries these constants (measured in `ps_defaults.psd`:
+        // `/24 0 /25 0 /33 0 /35 0 /40 2`; `/27` and `/28` are the name `/nil`). Their meaning is
+        // unmeasured, so a file's own values are kept above and only a fresh sheet gets the
+        // numeric defaults; `/27` and `/28` are omitted and Photoshop defaults them.
+        for (key, value) in [("24", 0), ("25", 0), ("33", 0), ("35", 0), ("40", 2)] {
+            para_key(&mut items, key, E::Int(value));
+        }
+    }
+    E::Dict(items)
+}
+
+/// The paragraph sheet of a `Txt2` paragraph run. Photoshop nests it twice
+/// (`<< /0 << /0 << /0 () /5 <<sheet>> /6 1 >> >> /1 len >>`); this writer's own earlier form
+/// put the data directly under `/0` (`<< /0 << /0 () /5 <<sheet>> /6 1 >> /1 len >>`), so both
+/// are read.
+pub(crate) fn para_run_sheet(run: &E) -> Option<&E> {
+    run.path(&["0", "0", "5"]).or_else(|| run.path(&["0", "5"]))
+}
+
+/// `Txt2` paragraph runs of a layer: one per text paragraph, each with its UTF-16 length (the
+/// object text is the layer's text with `\r` breaks and a terminal `\r`) and the paragraph style
+/// at the paragraph's first byte. Photoshop stores one run per paragraph here whether or not the
+/// model carries an explicit `ParagraphRun` for it.
+fn txt2_paragraph_runs(layer: &TextLayer, base: Option<&[E]>) -> Vec<E> {
+    let paragraphs = text_paragraphs(layer);
+    let mut out = Vec::with_capacity(paragraphs.len());
+    for (i, (style, len)) in paragraphs.iter().enumerate() {
+        let base_run = base.and_then(|runs| runs.get(i));
+        let sheet = txt2_para_sheet(style, base_run.and_then(para_run_sheet));
+        // Photoshop nests the run's data twice (`<< /0 << /0 << /0 () /5 … /6 1 >> >> /1 len >>`).
+        // A base run in this writer's older flat form (`<< /0 << /0 () /5 … /6 1 >> /1 len >>`) is
+        // read and rewritten nested, so both forms round-trip and Photoshop reads the sheet.
+        let mut data = match base_run.and_then(|run| run.path(&["0", "0"])) {
+            Some(E::Dict(items)) => E::Dict(items.clone()),
+            _ => match base_run.and_then(|run| run.path(&["0"])) {
+                Some(E::Dict(items)) => E::Dict(items.clone()),
+                _ => E::dict(),
+            },
+        };
+        data.set("5", sheet);
+        if data.get("0").is_none() {
+            data.set("0", E::String(String::new()));
+        }
+        if data.get("6").is_none() {
+            data.set("6", E::Int(1));
+        }
+        let mut entry = match base_run {
+            Some(E::Dict(items)) => E::Dict(items.clone()),
+            _ => E::dict(),
+        };
+        entry.set("0", E::Dict(vec![("0".into(), data)]));
+        entry.set("1", E::Int(i64::try_from(*len).unwrap_or(0)));
+        out.push(entry);
+    }
+    out
+}
+
+/// The paragraph style of each text paragraph in `layer`, with the paragraph's UTF-16 length
+/// (terminal `\r` included): the styles a `Txt2` paragraph run table must carry.
+fn text_paragraphs(layer: &TextLayer) -> Vec<(ParagraphStyle, usize)> {
+    let runs = layer.paragraph_runs();
+    let text = format!("{}\r", layer.text.replace('\n', "\r"));
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    for part in text.split_inclusive('\r') {
+        let mut pos = 0usize;
+        let mut style = runs.last().map(|r| r.style.clone()).unwrap_or_default();
+        for run in &runs {
+            if at < pos.saturating_add(run.len) {
+                style = run.style.clone();
+                break;
+            }
+            pos = pos.saturating_add(run.len);
+        }
+        out.push((style, part.encode_utf16().count()));
+        at = at.saturating_add(part.len());
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// The engine adapter: `TextLayer` → `photocraft_text_re::psd::LayerSpec`
+// ---------------------------------------------------------------------------
+
+/// The engine's layer model for a fork layer. This crate keeps no text
+/// serialization logic of its own: `photocraft_text_re::psd` owns the
+/// `EngineData`/`Txt2`/`TySh` writers, the translation below is the whole
+/// adapter (units: `k = 72 / dpi`, the model stores points, the engine
+/// text-space units).
+pub(crate) fn spec_of_layer(layer: &TextLayer, dpi: f32) -> photocraft_text_re::psd::LayerSpec {
+    let k = 72.0 / if dpi.is_finite() && dpi > 0.0 { dpi } else { 72.0 };
+    let text = layer.text.replace('\n', "\r");
+    let chars = layer.char_runs();
+    // One entry per engine character: the model's characters plus the trailing
+    // U+000D terminator (which takes the last style). `pair_runs`' form: a
+    // character's EngineData `Kerning` is the space after the *previous*
+    // character, so character j carries the model kern of j-1 and the manual
+    // mode of j-2. The reader (`runs::from_engine_data`) maps it back the same
+    // way, so a per-character round trip is exact.
+    let mut entries: Vec<(CharStyle, usize, usize, i64, bool)> = Vec::new();
+    let mut offset = 0usize;
+    for (index, run) in chars.iter().enumerate() {
+        let end = (offset + run.len).min(text.len()).max(offset);
+        for ch in text[offset..end].chars() {
+            entries.push((run.style.clone(), index, ch.len_utf16(), 0, true));
+        }
+        offset = end;
+    }
+    if let Some(last) = chars.last() {
+        entries.push((last.style.clone(), chars.len() - 1, 1, 0, true));
+    }
+    let kern_units = |v: f32| if v.is_finite() { v.round().clamp(-10_000.0, 10_000.0) as i64 } else { 0 };
+    let manual = |s: &CharStyle| s.kerning == Kerning::Off || kern_units(s.kern) != 0;
+    for j in 0..entries.len() {
+        let (_, _, _, kern, auto) = &entries[j];
+        let _ = (kern, auto);
+        let k = if j >= 1 { kern_units(entries[j - 1].0.kern) } else { 0 };
+        let off = match j.checked_sub(2) {
+            Some(p) => manual(&entries[p].0) && (kern_units(entries[p].0.kern) == 0 || k != 0),
+            None => k != 0,
+        };
+        entries[j].3 = k;
+        entries[j].4 = !off;
+    }
+    let mut runs: Vec<photocraft_text_re::psd::RunSpec> = Vec::new();
+    let mut i = 0usize;
+    while i < entries.len() {
+        let key = (entries[i].1, entries[i].3, entries[i].4);
+        let mut j = i;
+        let mut len = 0usize;
+        while j < entries.len() && (entries[j].1, entries[j].3, entries[j].4) == key {
+            len += entries[j].2;
+            j += 1;
+        }
+        let mut spec = run_spec(&entries[i].0, k);
+        // The pair fields always win over the style's own kern: they are the
+        // shifted, per-character values the reader maps back.
+        spec.kerning = Some(entries[i].3.clamp(-32_768, 32_767) as i16);
+        spec.auto_kerning = Some(entries[i].4);
+        // The engine's run lengths include the terminal U+000D.
+        spec.len = len.max(1);
+        runs.push(spec);
+        i = j;
+    }
+    if runs.is_empty() {
+        runs.push(photocraft_text_re::psd::RunSpec { len: 1, ..run_spec(&CharStyle::default(), k) });
+    }
+    let paragraphs: Vec<photocraft_text_re::psd::ParagraphSpec> =
+        layer.paragraph_runs().iter().map(|run| paragraph_spec(&run.style, k)).collect();
+    let (frame, shape) = frame_of(&layer.shape);
+    let preserve_trailing_break = text.ends_with('\r');
+    photocraft_text_re::psd::LayerSpec {
+        text,
+        runs,
+        paragraph: paragraphs.first().cloned().unwrap_or_default(),
+        paragraphs,
+        aa: antialias_code(layer.antialias),
+        frame,
+        shape,
+        orientation: Some(if layer.orientation == Orientation::Vertical { 1 } else { 0 }),
+        transform: Some(layer.transform.m),
+        atlas: None,
+        fractional: None,
+        // The editor keeps the empty final paragraph a caret can sit on.
+        preserve_trailing_break,
+    }
+}
+
+/// One `RunSpec`: the character style, converted to engine units.
+fn run_spec(style: &CharStyle, k: f32) -> photocraft_text_re::psd::RunSpec {
+    let unit = |pt: f32| pt / k;
+    let old_style = style.features.iter().any(|f| f.tag == "onum" && f.value > 0);
+    let features: Vec<photocraft_text_re::runs::RunFeature> =
+        style.features.iter().filter(|f| f.tag != "onum").map(|f| photocraft_text_re::runs::RunFeature { tag: f.tag.clone(), value: f.value }).collect();
+    let (kerning_mode, kerning) = kerning_of(style);
+    photocraft_text_re::psd::RunSpec {
+        len: 0,
+        font: Some(style.postscript_name.clone().unwrap_or_else(|| postscript_for(style))),
+        size: Some(unit(style.size_pt)),
+        leading: style.leading_pt.map(unit),
+        auto_leading: Some(style.leading_pt.is_none()),
+        tracking: Some(style.tracking.round() as i16),
+        baseline_shift: Some(unit(style.baseline_shift_pt)),
+        horizontal_scale: Some(style.horizontal_scale),
+        vertical_scale: Some(style.vertical_scale),
+        color: Some(color_rgb(&style.color)),
+        auto_kerning: Some(matches!(style.kerning, Kerning::Metrics)),
+        kerning,
+        kerning_mode,
+        bold: style.faux_bold,
+        italic: style.faux_italic,
+        underline: style.underline,
+        strikethrough: style.strikethrough,
+        all_caps: matches!(style.caps, Caps::AllCaps),
+        small_caps: matches!(style.caps, Caps::SmallCaps),
+        old_style,
+        ligatures: Some(style.ligatures),
+        alternate_ligatures: Some(style.discretionary_ligatures),
+        no_break: None,
+        language: language_id(style.language.as_deref()),
+        stroke: None,
+        baseline: Some(match style.baseline {
+            FontBaseline::Superscript => 1,
+            FontBaseline::Subscript => 2,
+            FontBaseline::Normal => 0,
+        }),
+        rotate_roman: Some(style.rotate_roman),
+        features,
+    }
+}
+
+/// The engine's kerning pair: a manual `kern` wins, else the mode
+/// (`0` manual, `1` metrics, `2` optical).
+fn kerning_of(style: &CharStyle) -> (Option<i64>, Option<i16>) {
+    if style.kern != 0.0 && style.kern.is_finite() {
+        // Photoshop's manual kern is a 1/1000 em value; the engine clamps it to
+        // its widest representable pair kern (as `read_layer` validates).
+        return (Some(0), Some(style.kern.round().clamp(-10_000.0, 10_000.0) as i16));
+    }
+    let mode = match style.kerning {
+        Kerning::Optical => 2,
+        Kerning::Off => 0,
+        Kerning::Metrics => 1,
+    };
+    (Some(mode), None)
+}
+
+/// A style colour as the engine stores it: straight RGB, 8 bits per channel.
+fn color_rgb(color: &Color) -> [u8; 3] {
+    let [r, g, b] = color.to_rgb();
+    let channel = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    [channel(r), channel(g), channel(b)]
+}
+
+/// One `ParagraphSpec`: the paragraph style, converted to engine units.
+fn paragraph_spec(style: &ParagraphStyle, k: f32) -> photocraft_text_re::psd::ParagraphSpec {
+    let unit = |pt: f32| pt / k;
+    photocraft_text_re::psd::ParagraphSpec {
+        // The engine's code space is the `EngineData` one (5 = justify all,
+        // 6 = justify last left), not `Txt2` `/5/0`.
+        justification: match style.align {
+            TextAlign::Right => 1,
+            TextAlign::Center => 2,
+            TextAlign::JustifyCenter => 3,
+            TextAlign::JustifyRight => 4,
+            TextAlign::JustifyAll => 5,
+            TextAlign::JustifyLeft => 6,
+            TextAlign::Left => 0,
+        },
+        every_line_composer: style.every_line_composer,
+        first_line_indent: unit(style.first_line_indent_pt),
+        start_indent: unit(style.start_indent_pt),
+        end_indent: unit(style.end_indent_pt),
+        space_before: unit(style.space_before_pt),
+        space_after: unit(style.space_after_pt),
+        auto_leading: style.auto_leading,
+        word_spacing: style.justification_word,
+        letter_spacing: style.justification_letter,
+        glyph_scaling: style.justification_glyph,
+        hanging_punctuation: style.hanging_punctuation,
+        hyphenate: style.hyphenate,
+        hyphenate_words_longer_than: i64::from(style.hyphenate_word_size),
+        hyphenate_after_first: i64::from(style.hyphenate_min_before),
+        hyphenate_before_last: i64::from(style.hyphenate_min_after),
+        hyphenate_limit: i64::from(style.hyphen_limit),
+        hyphenate_zone: unit(style.hyphenation_zone_pt),
+        hyphenate_capital_words: style.hyphenate_capitalized,
+        burasagari: style.burasagari,
+        kinsoku_order: i64::from(style.kinsoku_order),
+    }
+}
+
+/// The engine's anti-alias code (`0` none, `1` crisp, `2` strong, `3` smooth,
+/// `4` sharp); the platform modes live only in the `TySh` descriptor's `AntA`
+/// and have no code, so they stay unset here and are written by [`build_tysh`].
+fn antialias_code(antialias: AntiAlias) -> Option<i64> {
+    Some(match antialias {
+        AntiAlias::None => 0,
+        AntiAlias::Crisp => 1,
+        AntiAlias::Strong => 2,
+        AntiAlias::Smooth => 3,
+        AntiAlias::Sharp => 4,
+        AntiAlias::Windows | AntiAlias::WindowsLcd => return None,
+    })
+}
+
+/// The descriptor `AntA` value for a model anti-alias mode.
+fn antialias_name(antialias: AntiAlias) -> &'static str {
+    match antialias {
+        AntiAlias::None => "Anno",
+        AntiAlias::Sharp => "antiAliasSharp",
+        AntiAlias::Crisp => "AnCr",
+        AntiAlias::Strong => "AnSt",
+        AntiAlias::Smooth => "AnSm",
+        AntiAlias::Windows => "antiAliasPlatformGray",
+        AntiAlias::WindowsLcd => "antiAliasPlatformLCD",
+    }
+}
+
+/// The `Txt2` `/6/38` language id for a BCP-47 tag; only the measured ids map.
+fn language_id(tag: Option<&str>) -> Option<i64> {
+    match tag? {
+        "en-GB" => Some(14),
+        "de-DE" => Some(42),
+        _ => None,
+    }
+}
+
+/// The layer's frame and shape for the engine. Box and area text get their
+/// rectangle as both the engine frame and a kind-1 box path; type on a path
+/// keeps its curve, with the frame being the path's text-space bounds.
+fn frame_of(shape: &TextShape) -> (Option<[f32; 4]>, Option<photocraft_text_re::psd::ShapeSpec>) {
+    let bounds = |points: &[[f32; 2]]| -> Option<[f32; 4]> {
+        let mut x0 = f32::INFINITY;
+        let mut y0 = f32::INFINITY;
+        let mut x1 = f32::NEG_INFINITY;
+        let mut y1 = f32::NEG_INFINITY;
+        for [x, y] in points {
+            if !x.is_finite() || !y.is_finite() {
+                return None;
+            }
+            x0 = x0.min(*x);
+            y0 = y0.min(*y);
+            x1 = x1.max(*x);
+            y1 = y1.max(*y);
+        }
+        (x1 >= x0 && y1 >= y0).then_some([x0, y0, x1, y1])
+    };
+    // A shape with a non-finite point (`NaN`/`inf` from a malformed file) cannot
+    // be authored: Photoshop would get a NaN frame. Degrade it to point text —
+    // the engine then writes `PointBase` and finite descriptor bounds.
+    let finite = |r: [f32; 4]| r.iter().all(|v| v.is_finite());
+    match shape {
+        TextShape::Point => (None, None),
+        TextShape::Box { x, y, width, height } => {
+            let frame = [*x, *y, x + width, y + height];
+            if finite(frame) {
+                (Some(frame), crate::psd_path::shape_spec(shape))
+            } else {
+                (None, None)
+            }
+        }
+        TextShape::Area { path } => match path.control_bounds() {
+            Some((x0, y0, x1, y1)) => {
+                let frame = [x0 as f32, y0 as f32, x1 as f32, y1 as f32];
+                if finite(frame) {
+                    (Some(frame), crate::psd_path::shape_spec(shape))
+                } else {
+                    (None, None)
+                }
+            }
+            None => (None, None),
+        },
+        TextShape::Path { .. } => {
+            let (_, points) = crate::psd_path::shape_for_frame(shape);
+            match bounds(&points) {
+                Some(frame) => (Some(frame), crate::psd_path::shape_spec(shape)),
+                None => (None, None),
+            }
+        }
+    }
+}
+
+/// Photoshop's own scaffolding for a `Txt2` block (PS 20.0.2): the `/98` version, the document
+/// resources under `/0` and the text-engine state under `/1`, with the object array, frame list
+/// and font list empty. Photoshop refuses a block that lacks it ("General Photoshop error"), and
+/// its CoolType reader walks the numbered `/0` and `/1` keys in order, so a native block starts
+/// from this text (keeping Photoshop's key order) instead of a hand-built outer dictionary.
+const NATIVE_TXT2_SCAFFOLD: &[u8] = include_bytes!("native_txt2.ps");
+
+/// [`NATIVE_TXT2_SCAFFOLD`] parsed, or a bare `/98` block if the constant ever fails to parse.
+fn native_scaffold() -> E {
+    parse_txt2(NATIVE_TXT2_SCAFFOLD).unwrap_or_else(|| E::Dict(vec![("98".into(), E::Dict(vec![("0".into(), E::Int(7))]))]))
+}
+
+/// Add the scaffolding keys a numbered block needs to open in Photoshop, keeping everything the
+/// block already holds. `/0 /5`, `/0 /6` and `/1 /0` are each required ("General Photoshop
+/// error" when one is missing); the numbered keys stay in ascending order, which CoolType's
+/// positional walk needs.
+fn repair_scaffolding(block: E) -> E {
+    let E::Dict(mut top) = block else { return block };
+    let E::Dict(scaffold) = native_scaffold() else { return E::Dict(top) };
+    for (key, wanted) in [("0", ["5", "6"].as_slice()), ("1", ["0", "2", "3"].as_slice())] {
+        let Some(E::Dict(native)) = scaffold.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()) else { continue };
+        let Some(slot) = top.iter_mut().find(|(k, _)| k == key).map(|(_, v)| v) else {
+            // The block has no `/0` or `/1` at all: take the scaffold's whole tree.
+            top.push((key.to_string(), E::Dict(native)));
+            continue;
+        };
+        let E::Dict(items) = slot else { continue };
+        for want in wanted {
+            if items.iter().any(|(k, _)| k == want) {
+                continue;
+            }
+            if let Some((k, v)) = native.iter().find(|(k, _)| k == want) {
+                items.push((k.clone(), v.clone()));
+            }
+        }
+        items.sort_by_key(|(k, _)| k.parse::<u32>().unwrap_or(u32::MAX));
+    }
+    E::Dict(top)
+}
+
+/// The document `Txt2` block for `objects` (`(TextIndex, layer)`), starting from
+/// `previous` so Photoshop's own objects and every unmodelled key survive.
 pub fn build_txt2(objects: &[(i32, &TextLayer)], previous: Option<&[u8]>) -> Vec<u8> {
     build_txt2_at(objects, previous, 72.0)
 }
 
-/// [`build_txt2`] for a document of `dpi` (the style runs of new and edited objects carry sizes
-/// in the document's points, as EngineData does).
+/// [`build_txt2`] at `dpi` (the layer's point units become engine units).
 pub fn build_txt2_at(objects: &[(i32, &TextLayer)], previous: Option<&[u8]>, dpi: f32) -> Vec<u8> {
-    let prev = previous.and_then(parse_txt2);
+    let mut prev = previous.and_then(parse_txt2);
+    // A numbered block without Photoshop's scaffolding is refused at open ("General Photoshop
+    // error"): our older native saves wrote only `/98`, a frame list and an object array, and a
+    // CoolType reader walks the numbered `/0` and `/1` keys, so the block needs Photoshop's own
+    // document resources (`/0 /5`, `/0 /6`) and text-engine state (`/1 /0`) as well. Such a block
+    // is rebuilt from the scaffolding below instead of repaired in place; a Photoshop block (which
+    // always has them) keeps its bytes as before (#2374).
+    let numbered = prev.as_ref().is_some_and(|p| p.path(&["1", "1"]).and_then(E::as_array).is_some_and(|a| !a.is_empty()));
+    let scaffolding = prev.as_ref().is_some_and(|p| {
+        p.path(&["0", "5"]).is_some() && p.path(&["0", "6"]).is_some() && p.path(&["1", "0"]).is_some()
+    });
+    if numbered && !scaffolding {
+        // Repair, do not discard: keep the file's own numbered keys (its fonts, frames, objects,
+        // extras) and add the scaffolding keys CoolType needs. Dropping the block would lose the
+        // file's objects and their composed caches; only the three keys below are required (each
+        // proven by removing it and watching Photoshop refuse the file).
+        prev = prev.map(repair_scaffolding);
+    }
     let prev_objects: &[E] = prev.as_ref().and_then(|p| p.path(&["1", "1"]).and_then(E::as_array)).unwrap_or(&[]);
     let mut slots: Vec<E> = prev_objects.to_vec();
     // The older Photoshop's objects (#6971): named keys at `/DocumentObjects /TextObjects`
@@ -681,7 +1187,13 @@ pub fn build_txt2_at(objects: &[(i32, &TextLayer)], previous: Option<&[u8]>, dpi
     // A PhotoCraft-native block: the document had no `Txt2` of its own (#10308). Only such a
     // block gets the fresh point-text objects, minimal style runs, seeded font list and frame
     // list below; a file's own block (Photoshop's, any era) is written as before (#2374, #7698).
-    let native = prev.is_none();
+    // A PhotoCraft-native block: one this save starts from nothing, or the engine's empty
+    // scaffolding (no text object of either era). Only such a block gets the fresh frame and font
+    // lists below; a file's own block (Photoshop's, any era) is written as before (#2374, #7698).
+    let native = prev.as_ref().is_none_or(|p| {
+        p.path(&["1", "1"]).and_then(E::as_array).is_none_or(<[E]>::is_empty)
+            && p.path(&["DocumentObjects", "TextObjects"]).and_then(E::as_array).is_none_or(<[E]>::is_empty)
+    });
     let seed_empty = native;
     // Looked up once per save, not per layer: a crafted block with many objects must not cost
     // a pass over all of them for every type layer.
@@ -690,7 +1202,7 @@ pub fn build_txt2_at(objects: &[(i32, &TextLayer)], previous: Option<&[u8]>, dpi
     let template = prev_objects.iter().rev().find(|o| names_one_frame(o) && fits(o, &mut { TEMPLATE_NODES }) && edited_object(o, "\r").is_some());
     // The frame each written object is drawn in, with its layer's shape (type on a path lives
     // only in the frame, #7962).
-    let mut frame_shapes: Vec<(usize, &TextShape)> = Vec::new();
+    let mut frame_shapes: Vec<(usize, &TextShape, bool)> = Vec::new();
     // A new or rebuilt object must not be drawn in a frame another object is drawn in: the two
     // layers would share one shape. The frames the file's objects name are taken; a free one is
     // found past the frame list and the slots (`pad_frames` adds it).
@@ -785,7 +1297,11 @@ pub fn build_txt2_at(objects: &[(i32, &TextLayer)], previous: Option<&[u8]>, dpi
             .flatten();
         let reuse = kept.is_some() || edited.is_some();
         let unchanged = kept.is_some();
-        let mut object = kept.cloned().or(edited).or(fresh).unwrap_or_else(E::dict);
+        let candidate = kept.cloned().or(edited).or(fresh);
+        // A file's block with no object for this layer and no template to copy keeps the bare
+        // stub it always got: no view, no paragraph runs (#7698, #10308).
+        let has_object = candidate.is_some();
+        let mut object = candidate.unwrap_or_else(E::dict);
         let mut model = object.get("0").cloned().filter(|m| matches!(m, E::Dict(_))).unwrap_or_else(E::dict);
         // A new or edited object takes the layer's own style: Photoshop reads the character style
         // from these runs, so the template's (or the old text's) would show, and come back on
@@ -805,7 +1321,9 @@ pub fn build_txt2_at(objects: &[(i32, &TextLayer)], previous: Option<&[u8]>, dpi
                 .map(|&(mode, len)| {
                     // `<< /0 << /0 << /0 () /6 << /0 0 /11 mode >> >> >> /1 len >>`.
                     let style = E::Dict(vec![("0".into(), E::Int(0)), ("11".into(), E::Int(mode))]);
-                    let data = E::Dict(vec![("0".into(), E::String(String::new())), ("6".into(), style)]);
+                    // `/5 1` marks the wrapper as a character run; without it Photoshop's
+                    // composer falls back to the shared default sheet and ignores the style.
+                    let data = E::Dict(vec![("0".into(), E::String(String::new())), ("5".into(), E::Int(1)), ("6".into(), style)]);
                     E::Dict(vec![("0".into(), E::Dict(vec![("0".into(), data)])), ("1".into(), E::Int(len as i64))])
                 })
                 .collect()
@@ -815,9 +1333,19 @@ pub fn build_txt2_at(objects: &[(i32, &TextLayer)], previous: Option<&[u8]>, dpi
             Some(style_run @ E::Dict(_)) => style_run.set("0", E::Array(runs)),
             _ => model.set("6", E::Dict(vec![("0".into(), E::Array(runs))])),
         }
+        // The paragraph sheets (`/5`) are what Photoshop's composer reads back: one run per
+        // paragraph of the model's text, the file's own sheet kept as the base when there is one.
+        // A kept object keeps its sheets as the file has them (byte for byte); a new or edited one
+        // gets them from the layer.
+        if !unchanged && has_object && model.get("0").is_some() {
+            let base = model.path(&["5", "0"]).and_then(E::as_array).map(<[E]>::to_vec);
+            model.set("5", E::Dict(vec![("0".into(), E::Array(txt2_paragraph_runs(layer, base.as_deref())))]));
+        }
         object.set("0", model);
         if let Some(frame) = object_frame(&object, true) {
-            frame_shapes.push((frame, &layer.shape));
+            // Vertical text needs Photoshop's `/2 /1 2` frame marker: the `TySh` `Ornt` and the
+            // engine data alone leave Photoshop opening the layer horizontal and re-flowing it.
+            frame_shapes.push((frame, &layer.shape, layer.orientation == Orientation::Vertical));
         }
         if slots.len() <= at {
             slots.resize(at + 1, E::dict());
@@ -830,27 +1358,36 @@ pub fn build_txt2_at(objects: &[(i32, &TextLayer)], previous: Option<&[u8]>, dpi
     // `/1` whatever it holds beside the text objects. A PhotoCraft-native block gets a frame list
     // (`/0 /8 /0`) so each object's view can name a frame (#10308, #7698); a file's block is never
     // given a `/0` or a frame list it didn't have (#2374).
-    let mut outer = prev.clone().unwrap_or_else(|| {
-        E::Dict(vec![
-            ("98".into(), E::Dict(vec![("0".into(), E::Int(14))])),
-            ("0".into(), E::Dict(vec![("8".into(), E::Dict(vec![("0".into(), E::Array(vec![]))]))])),
-        ])
-    });
+    let mut outer = prev.clone().unwrap_or_else(native_scaffold);
+    // The engine's empty scaffolding carries no frame list; a native save that draws an object
+    // needs one (a view naming a frame the list lacks made Photoshop open point text at the
+    // origin). A file's block keeps whatever it had (#2374).
+    if native {
+        let has_doc = outer.get("0").is_some();
+        if !has_doc {
+            outer.set("0", E::dict());
+        }
+        if let Some(doc @ E::Dict(_)) = outer.get_mut("0")
+            && doc.get("8").is_none()
+        {
+            doc.set("8", E::Dict(vec![("0".into(), E::Array(vec![]))]));
+        }
+    }
     pad_frames(&mut outer, slots.len().max(frames_needed));
     // A path layer's frame holds its path; a layer taken off its path loses its path frame. An
     // unchanged path leaves the file's frame as it was, and so does a frame the file already had
     // more than one object drawn in (which layer's shape it should hold is unknown).
     let mut claims: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
-    for (at, _) in &frame_shapes {
+    for (at, _, _) in &frame_shapes {
         *claims.entry(*at).or_default() += 1;
     }
     if let Some(E::Array(frames)) = outer.get_mut("0").and_then(|v| v.get_mut("8")).and_then(|v| v.get_mut("0")) {
-        for (at, shape) in frame_shapes {
+        for (at, shape, vertical) in frame_shapes {
             if claims.get(&at) != Some(&1) {
                 continue;
             }
             if let Some(entry) = frames.get_mut(at) {
-                crate::psd_path::update_frame(entry, shape);
+                crate::psd_path::update_frame_oriented(entry, shape, vertical);
             }
         }
     }
@@ -867,9 +1404,29 @@ pub fn build_txt2_at(objects: &[(i32, &TextLayer)], previous: Option<&[u8]>, dpi
             _ => {}
         }
     }
+    // A kept object's frame is the file's own, so its text-flow marker can disagree with the
+    // layer: the file may predate the vertical frame marker (`/2 /1 2`), and Photoshop then
+    // opens a vertical layer horizontal however its `TySh` and engine data read. Set the marker
+    // on every frame a written object names, before the objects move into `outer`.
+    let frame_flow: Vec<(usize, bool)> = objects
+        .iter()
+        .filter(|(_, layer)| !matches!(layer.shape, TextShape::Path { .. }))
+        .filter_map(|(index, layer)| {
+            let at = usize::try_from(*index).ok()?;
+            let frame = object_frame(slots.get(at)?, true)?;
+            Some((frame, layer.orientation == Orientation::Vertical))
+        })
+        .collect();
     match outer.get_mut("1") {
         Some(objs @ E::Dict(_)) => objs.set("1", E::Array(slots)),
         _ => outer.set("1", E::Dict(vec![("1".into(), E::Array(slots))])),
+    }
+    if let Some(E::Array(frames)) = outer.get_mut("0").and_then(|v| v.get_mut("8")).and_then(|v| v.get_mut("0")) {
+        for (frame, vertical) in frame_flow {
+            if let Some(entry) = frames.get_mut(frame) {
+                crate::psd_path::set_frame_orientation(entry, vertical);
+            }
+        }
     }
     // The older Photoshop's objects, whatever the loop fixed in them (an untouched list is left
     // exactly as the file has it, so the byte-for-byte return below still holds).
@@ -896,261 +1453,202 @@ pub fn build_txt2_at(objects: &[(i32, &TextLayer)], previous: Option<&[u8]>, dpi
         _ => ed::write_bare(&[]),
     }
 }
-
-/// Updates (or creates) an EngineData tree for `layer`.
+/// The `EngineData` tree a layer's `TySh` carries, through the engine's writer.
+///
+/// `template` is the layer's current tree: the engine edits it in place so
+/// Photoshop's unmodelled keys survive.
 pub fn build_engine_data(layer: &TextLayer, template: Option<E>, dpi: f32) -> E {
-    let k = 72.0 / if dpi.is_finite() && dpi > 0.0 { dpi } else { 72.0 };
-    let fresh = || E::Dict(vec![("EngineDict".into(), E::dict()), ("ResourceDict".into(), E::dict())]);
-    // The template comes from the PSD: it may not be a dictionary or may lack `EngineDict`.
-    let mut e = match template {
-        Some(t @ E::Dict(_)) => t,
-        _ => fresh(),
-    };
-    if !matches!(e.get("EngineDict"), Some(E::Dict(_))) {
-        e.set("EngineDict", E::dict());
-    }
-    let runs = layer.char_runs();
-    let paras = layer.paragraph_runs();
-    let text = layer.text.replace('\n', "\r");
-    let ed_text = format!("{text}\r");
-
-    // Fonts: keep the template's font list and append new PostScript names.
-    let mut fonts: Vec<String> = e
-        .path(&["ResourceDict", "FontSet"])
-        .and_then(E::as_array)
-        .map(|a| a.iter().map(|f| f.get("Name").and_then(E::as_str).unwrap_or("").to_string()).collect())
-        .unwrap_or_default();
-    let mut font_index = |ps: String| match fonts.iter().position(|f| *f == ps) {
-        Some(i) => i,
-        None => {
-            fonts.push(ps);
-            fonts.len() - 1
-        }
-    };
-    let mut sruns = Vec::new();
-    let mut slens = Vec::new();
-    for (ri, pair, n) in pair_runs(&ed_text, &runs) {
-        let Some(r) = runs.get(ri) else { continue };
-        let fi = font_index(postscript_for(&r.style));
-        let mut data = style_sheet_data(&r.style, fi, k);
-        data.set("AutoKerning", E::Bool(pair.0));
-        data.set("Kerning", E::Int(pair.1));
-        sruns.push(E::Dict(vec![("StyleSheet".into(), E::Dict(vec![("StyleSheetData".into(), data)]))]));
-        slens.push(E::Int(n as i64));
-    }
-    let mut pruns = Vec::new();
-    let mut plens = Vec::new();
-    let mut at = 0usize;
-    for (i, p) in paras.iter().enumerate() {
-        let piece = &text[at..at + p.len];
-        at += p.len;
-        let mut n = utf16_len(piece);
-        if i + 1 == paras.len() {
-            n += 1;
-        }
-        pruns.push(E::Dict(vec![(
-            "ParagraphSheet".into(),
-            E::Dict(vec![("DefaultStyleSheet".into(), E::Int(0)), ("Properties".into(), paragraph_properties(&p.style, k))]),
-        )]));
-        plens.push(E::Int(n));
-    }
-
-    let Some(dict) = e.get_mut("EngineDict") else {
-        return fresh();
-    };
-    let mut editor = dict.get("Editor").cloned().unwrap_or_else(E::dict);
-    editor.set("Text", E::String(ed_text));
-    dict.set("Editor", editor);
-    let mut pr = dict.get("ParagraphRun").cloned().unwrap_or_else(E::dict);
-    pr.set("RunArray", E::Array(pruns));
-    pr.set("RunLengthArray", E::Array(plens));
-    if pr.get("IsJoinable").is_none() {
-        pr.set("IsJoinable", E::Int(1));
-    }
-    dict.set("ParagraphRun", pr);
-    let mut sr = dict.get("StyleRun").cloned().unwrap_or_else(E::dict);
-    sr.set("RunArray", E::Array(sruns));
-    sr.set("RunLengthArray", E::Array(slens));
-    if sr.get("IsJoinable").is_none() {
-        sr.set("IsJoinable", E::Int(2));
-    }
-    dict.set("StyleRun", sr);
-    dict.set(
-        "AntiAlias",
-        E::Int(match layer.antialias {
-            AntiAlias::None => 0,
-            AntiAlias::Crisp => 1,
-            AntiAlias::Strong => 2,
-            AntiAlias::Smooth => 3,
-            AntiAlias::Sharp => 4,
-            // No Photoshop file confirms the platform modes' numbers here; the `AntA` descriptor
-            // carries the exact mode, and Smooth is the closest.
-            AntiAlias::Windows | AntiAlias::WindowsLcd => 3,
-        }),
-    );
-    if dict.get("UseFractionalGlyphWidths").is_none() {
-        dict.set("UseFractionalGlyphWidths", E::Bool(true));
-    }
-    let (shape_type, box_bounds) = match &layer.shape {
-        // Type on a path: the path goes into the layer's `Txt2` frame ([`build_txt2`], #7962),
-        // which only a file that already has a `Txt2` object for the layer gets; EngineData
-        // keeps it as point text, one line for readers (and files) without that frame.
-        TextShape::Point | TextShape::Path { .. } => (0, None),
-        TextShape::Box { x, y, width, height } => (1, Some([*x, *y, x + width, y + height])),
-        // PSD area type is not written yet: the layer saves as paragraph text over the path's
-        // bounds, so Photoshop opens it with the same text wrapping in a rectangle.
-        TextShape::Area { path } => match crate::area::path_bounds(path) {
-            Some((x0, y0, x1, y1)) => (1, Some([x0 as f32, y0 as f32, x1 as f32, y1 as f32])),
-            None => (0, None),
-        },
-    };
-    let mut photoshop = E::Dict(vec![("ShapeType".into(), E::Int(shape_type))]);
-    match box_bounds {
-        None => photoshop.set("PointBase", E::Array(vec![real(0.0), real(0.0)])),
-        Some(b) => photoshop.set("BoxBounds", E::Array(b.iter().map(|v| real(*v)).collect())),
-    }
-    photoshop.set(
-        "Base",
-        E::Dict(vec![
-            ("ShapeType".into(), E::Int(shape_type)),
-            ("TransformPoint0".into(), E::Array(vec![real(1.0), real(0.0)])),
-            ("TransformPoint1".into(), E::Array(vec![real(0.0), real(1.0)])),
-            ("TransformPoint2".into(), E::Array(vec![real(0.0), real(0.0)])),
-        ]),
-    );
-    // EngineData writing direction and procession, as Photoshop writes vertical type: 2 and 1
-    // (horizontal: 0 and 0). The descriptor's `Ornt` agrees.
-    let writing = if layer.orientation == Orientation::Vertical { 2 } else { 0 };
-    let child = E::Dict(vec![
-        ("ShapeType".into(), E::Int(shape_type)),
-        ("Procession".into(), E::Int(i64::from(writing == 2))),
-        ("Lines".into(), E::Dict(vec![("WritingDirection".into(), E::Int(writing)), ("Children".into(), E::Array(vec![]))])),
-        ("Cookie".into(), E::Dict(vec![("Photoshop".into(), photoshop)])),
-    ]);
-    dict.set(
-        "Rendered",
-        E::Dict(vec![
-            ("Version".into(), E::Int(1)),
-            ("Shapes".into(), E::Dict(vec![("WritingDirection".into(), E::Int(writing)), ("Children".into(), E::Array(vec![child]))])),
-        ]),
-    );
-
-    for key in ["ResourceDict", "DocumentResources"] {
-        if key == "DocumentResources" && e.get(key).is_none() {
-            let rd = e.get("ResourceDict").cloned().unwrap_or_else(E::dict);
-            e.set(key, rd);
-            continue;
-        }
-        let Some(rd) = e.get_mut(key) else { continue };
-        let fontset = font_set(&fonts, rd.get("FontSet"));
-        rd.set("FontSet", fontset);
-        if rd.get("StyleSheetSet").is_none() {
-            let base = runs.first().map(|r| r.style.clone()).unwrap_or_default();
-            rd.set(
-                "StyleSheetSet",
-                E::Array(vec![E::Dict(vec![("Name".into(), E::String("Normal RGB".into())), ("StyleSheetData".into(), style_sheet_data(&base, 0, k))])]),
-            );
-        }
-        if rd.get("ParagraphSheetSet").is_none() {
-            rd.set(
-                "ParagraphSheetSet",
-                E::Array(vec![E::Dict(vec![
-                    ("Name".into(), E::String("Normal RGB".into())),
-                    ("DefaultStyleSheet".into(), E::Int(0)),
-                    ("Properties".into(), paragraph_properties(&ParagraphStyle::default(), k)),
-                ])]),
-            );
-        }
-        for (k2, v) in [("TheNormalStyleSheet", 0), ("TheNormalParagraphSheet", 0)] {
-            if rd.get(k2).is_none() {
-                rd.set(k2, E::Int(v));
+    let spec = spec_of_layer(layer, dpi);
+    let mut out = match template {
+        None => from_engine(&photocraft_text_re::psd::build_engine_data(&spec)),
+        Some(template) => {
+            let mut root = to_engine(&template);
+            if photocraft_text_re::psd::apply_engine_data(&mut root, &spec).is_err() {
+                from_engine(&photocraft_text_re::psd::build_engine_data(&spec))
+            } else {
+                from_engine(&root)
             }
         }
+    };
+    rebuild_font_sets(&mut out, &spec);
+    out
+}
+
+/// Rebuilds both `FontSet`s from the template's own records, keeping Photoshop's
+/// duplicate/dictionary metadata (#1348): `ResourceDict` is the template's record
+/// names plus the spec's fonts, one record per name (`font_set` pulls each
+/// original record once); `DocumentResources` mirrors that name order, taking its
+/// records from its own set first and the `ResourceDict` ones after, so a
+/// nameless or duplicate record is re-emitted with its dictionary (never
+/// synthesised), and a reordered copy is re-sorted to the resource order.
+fn rebuild_font_sets(root: &mut E, spec: &photocraft_text_re::psd::LayerSpec) {
+    let name_of = |f: &E| f.get("Name").and_then(E::as_str).unwrap_or("").to_string();
+    let original = root.get("ResourceDict").and_then(|d| d.get("FontSet")).cloned();
+    let mut names: Vec<String> = original.as_ref().and_then(E::as_array).map(|a| a.iter().map(name_of).collect()).unwrap_or_default();
+    for run in &spec.runs {
+        if let Some(font) = &run.font
+            && !names.contains(font)
+        {
+            names.push(font.clone());
+        }
     }
-    e
+    let resource = font_set(&names, original.as_ref());
+    if let Some(rd) = root.get_mut("ResourceDict") {
+        rd.set("FontSet", resource);
+    }
+    let document = root.get("DocumentResources").and_then(|d| d.get("FontSet")).cloned();
+    let mut candidates: Vec<E> = document.as_ref().and_then(E::as_array).map(<[_]>::to_vec).unwrap_or_default();
+    if let Some(records) = original.as_ref().and_then(E::as_array) {
+        candidates.extend(records.iter().cloned());
+    }
+    let mirrored = font_set(&names, Some(&E::Array(candidates)));
+    if let Some(doc) = root.get_mut("DocumentResources") {
+        doc.set("FontSet", mirrored);
+    }
 }
 
-/// The anti-aliasing mode for EngineData's `AntiAlias` number, as Photoshop writes it: 0 None,
-/// 1 Crisp, 2 Strong, 3 Smooth, 4 Sharp. Other numbers (platform modes) are left to `AntA`.
-pub(super) fn engine_antialias(n: f64) -> Option<AntiAlias> {
-    Some(match n as i64 {
-        0 => AntiAlias::None,
-        1 => AntiAlias::Crisp,
-        2 => AntiAlias::Strong,
-        3 => AntiAlias::Smooth,
-        4 => AntiAlias::Sharp,
-        _ => return None,
-    })
-}
-
-/// Builds the `TySh` block for `layer`, patching its current `psd_raw` when present.
-/// `ink` is the layer's rendered bounds in text space (for `bounds`/`boundingBox`).
+/// The `TySh` block for `layer`, patching its current `psd_raw` when present.
+/// `ink` is the layer's rendered bounds in text space (`bounds`/`boundingBox`).
 pub fn build_tysh(layer: &TextLayer, dpi: f32, ink: Option<[f32; 4]>) -> Vec<u8> {
-    let old = layer.psd_raw.as_deref().and_then(|d| parse_tysh(d));
-    let template = old.as_ref().and_then(|t| engine_data(&t.text));
-    let e = build_engine_data(layer, template, dpi);
-    let mut text = old.as_ref().map(|t| t.text.clone()).unwrap_or_else(|| Descriptor::new("TxLr"));
-    let set = |d: &mut Descriptor, key: &str, v: D| match d.items.iter_mut().find(|(k, _)| k.is(key)) {
-        Some(e) => e.1 = v,
-        None => d.items.push((Id::new(key), v)),
+    let spec = spec_of_layer(layer, dpi);
+    let template = layer.psd_raw.as_deref().map(|raw| raw.as_slice());
+    let Ok(bytes) = photocraft_text_re::psd::build_tysh_from(template, &spec, ink) else {
+        return layer.psd_raw.as_deref().cloned().unwrap_or_default();
     };
-    set(&mut text, "Txt ", D::Text(UnicodeString::new_nul(&layer.text.replace('\n', "\r"))));
-    if text.get("textGridding").is_none() {
-        set(&mut text, "textGridding", enumv("textGridding", "None"));
+    // The descriptor fields the engine model does not carry (`AntA`'s platform
+    // modes, warp, the warped trailing bounds) are still the fork's.
+    let Ok(mut tysh) = photocraft_psd::TySh::from_bytes(&bytes) else { return bytes };
+    if layer.psd_raw.is_none() {
+        // A layer the Type tool made has no `Txt2` object of its own yet; leaving
+        // the placeholder `TextIndex 0` would let it claim the file's object 0.
+        // The export assigns a free number and writes it before saving.
+        tysh.text_descriptor_mut().items.retain(|(key, _)| !key.is("TextIndex"));
     }
-    set(&mut text, "Ornt", enumv("Ornt", if layer.orientation == Orientation::Vertical { "Vrtc" } else { "Hrzn" }));
-    set(
-        &mut text,
-        "AntA",
-        enumv(
-            "Annt",
-            match layer.antialias {
-                AntiAlias::None => "Anno",
-                AntiAlias::Sharp => "antiAliasSharp",
-                AntiAlias::Crisp => "AnCr",
-                AntiAlias::Strong => "AnSt",
-                AntiAlias::Smooth => "AnSm",
-                AntiAlias::Windows => "antiAliasPlatformGray",
-                AntiAlias::WindowsLcd => "antiAliasPlatformLCD",
-            },
-        ),
-    );
-    let area = match &layer.shape {
-        TextShape::Area { path } => crate::area::path_bounds(path).map(|(x0, y0, x1, y1)| [x0 as f32, y0 as f32, x1 as f32, y1 as f32]),
-        _ => None,
+    // A cache-only refresh must reproduce the stored `TySh` byte-for-byte: these
+    // descriptor fields keep the file's own values (the platform `AntA` modes,
+    // warp keys this model omits, the warped trailing bounds), so only a real
+    // change is written.
+    if tysh.antialias().as_deref() != Some(antialias_name(layer.antialias)) {
+        tysh.set_antialias(antialias_name(layer.antialias));
+    }
+    let warped = match (&layer.warp, enum_value(&tysh.warp.descriptor, "warpStyle")) {
+        (Some(warp), _) => {
+            let want = photocraft_psd::text_layer::Warp {
+                style: warp.style.clone(),
+                value: f64::from(warp.value.clamp(-100.0, 100.0)),
+                perspective: f64::from(warp.horizontal_distortion.clamp(-100.0, 100.0)),
+                perspective_other: f64::from(warp.vertical_distortion.clamp(-100.0, 100.0)),
+                rotate: if warp.horizontal { photocraft_psd::text_layer::Orientation::Horizontal } else { photocraft_psd::text_layer::Orientation::Vertical },
+            };
+            if tysh.warp_settings() != want {
+                tysh.warp.descriptor = Descriptor::new("warp")
+                    .with("warpStyle", enumv("warpStyle", &warp.style))
+                    .with("warpValue", D::Double(want.value))
+                    .with("warpPerspective", D::Double(want.perspective))
+                    .with("warpPerspectiveOther", D::Double(want.perspective_other))
+                    .with("warpRotate", enumv("Ornt", if warp.horizontal { "Hrzn" } else { "Vrtc" }));
+            }
+            warp.style != "warpNone"
+        }
+        (None, Some(style)) => style != "warpNone",
+        (None, None) => false,
     };
-    let [l, t, r, b] = match (&layer.shape, area, ink) {
-        (&TextShape::Box { x, y, width, height }, _, _) => [x, y, x + width, y + height],
-        (_, Some(a), _) => a,
-        (_, _, Some(i)) => i,
-        _ => [0.0; 4],
-    };
-    let rect = |cls: &str| {
-        D::Descriptor(
-            Descriptor::new(cls)
-                .with("Left", D::UnitFloat { unit: *b"#Pnt", value: f64::from(l) })
-                .with("Top ", D::UnitFloat { unit: *b"#Pnt", value: f64::from(t) })
-                .with("Rght", D::UnitFloat { unit: *b"#Pnt", value: f64::from(r) })
-                .with("Btom", D::UnitFloat { unit: *b"#Pnt", value: f64::from(b) }),
-        )
-    };
-    set(&mut text, "bounds", rect("bounds"));
-    set(&mut text, "boundingBox", rect("boundingBox"));
-    set(&mut text, "EngineData", D::RawData(ed::write(&e)));
-    let warp = match (&layer.warp, old.as_ref().and_then(|o| o.warp.clone())) {
-        (Some(w), _) => Some(
-            Descriptor::new("warp")
-                .with("warpStyle", enumv("warpStyle", &w.style))
-                .with("warpValue", D::Double(f64::from(w.value)))
-                .with("warpPerspective", D::Double(f64::from(w.horizontal_distortion)))
-                .with("warpPerspectiveOther", D::Double(f64::from(w.vertical_distortion)))
-                .with("warpRotate", enumv("Ornt", if w.horizontal { "Hrzn" } else { "Vrtc" })),
-        ),
-        (None, Some(old)) if enum_value(&old, "warpStyle").as_deref() == Some("warpNone") => Some(old),
-        _ => None,
-    };
-    // Photoshop's trailing bounds: zeros for unwarped type, the text-space bounds when warped.
-    let warped = warp.as_ref().is_some_and(|w| enum_value(w, "warpStyle").is_some_and(|s| s != "warpNone"));
-    let bounds = if warped { [l, t, r, b] } else { [0.0; 4] };
-    write_tysh(&TySh { transform: layer.transform, text, warp, bounds })
+    // Photoshop writes the 16 trailing bytes as zeros for unwarped type and the
+    // text-space bounds for warped type.
+    let trailing = if warped { ink.unwrap_or([0.0; 4]) } else { [0.0; 4] };
+    if tysh.bounds_points() != trailing {
+        tysh.set_bounds_points(trailing);
+    }
+    // Keep the model's paragraph split. The engine writes one paragraph run per `\r`-terminated
+    // paragraph, each owning its break; a model can instead put the break at the start of the
+    // following run (a layer created by an older editor, or a hand-authored model). Writing the
+    // model's own lengths keeps the round trip exact, and it is layout-neutral: the engine splits
+    // the text at its breaks, not at these run ends.
+    if let Some(want) = model_paragraph_lens(layer)
+        && let Some(raw) = tysh.engine_data().map(<[u8]>::to_vec)
+        && let Ok(mut tree) = ed::parse(&raw)
+    {
+        let current: Vec<i64> = tree
+            .path(&["EngineDict", "ParagraphRun", "RunLengthArray"])
+            .or_else(|| tree.path(&["ParagraphRun", "RunLengthArray"]))
+            .and_then(E::as_array)
+            .map(|a| a.iter().filter_map(E::as_i64).collect())
+            .unwrap_or_default();
+        // Only when the two splits have the same number of runs: a model run may span several
+        // engine paragraphs (a style-only split inside a paragraph, or the synthetic empty final
+        // paragraph), and replacing those lengths would merge the paragraph sheets.
+        if !current.is_empty() && current.len() == want.len() && current != want {
+            let value = E::Array(want.iter().map(|n| E::Int(*n)).collect());
+            let mut patched = false;
+            if let Some(engine) = tree.get_mut("EngineDict")
+                && let Some(pr) = engine.get_mut("ParagraphRun")
+            {
+                pr.set("RunLengthArray", value.clone());
+                patched = true;
+            }
+            if !patched && let Some(pr) = tree.get_mut("ParagraphRun") {
+                pr.set("RunLengthArray", value);
+            }
+            tysh.set_engine_data(&ed::write(&tree));
+        }
+    }
+    tysh.to_bytes()
+}
+
+/// The `EngineData` paragraph run lengths (UTF-16 units) the model's paragraph split implies.
+///
+/// `EngineData` stores one run per paragraph and a run owns its trailing break, so a model whose
+/// runs put the break at the start of the next one is written with those exact lengths; deriving
+/// them from the text instead would re-split the runs on the way back. `None` when the model has
+/// no paragraph runs.
+fn model_paragraph_lens(layer: &TextLayer) -> Option<Vec<i64>> {
+    let runs = layer.paragraph_runs();
+    if runs.is_empty() {
+        return None;
+    }
+    let text = layer.text.replace('\n', "\r");
+    let mut at = 0usize;
+    let mut out = Vec::with_capacity(runs.len());
+    for (index, run) in runs.iter().enumerate() {
+        let mut end = (at + run.len).min(text.len());
+        while end < text.len() && !text.is_char_boundary(end) {
+            end += 1;
+        }
+        let piece = text.get(at..end)?;
+        let mut units = i64::try_from(piece.encode_utf16().count()).ok()?;
+        if index + 1 == runs.len() {
+            units += 1;
+        }
+        out.push(units);
+        at = end;
+    }
+    Some(out)
+}
+
+/// Converts the fork's `EngineData` tree to the engine's value type.
+fn to_engine(value: &E) -> photocraft_text_re::engine_data::Value {
+    use photocraft_text_re::engine_data::Value as Engine;
+    match value {
+        E::Dict(items) => Engine::Dict(items.iter().map(|(key, value)| (key.clone(), to_engine(value))).collect()),
+        E::Array(items) => Engine::Array(items.iter().map(to_engine).collect()),
+        E::String(text) | E::RawString(text) => Engine::Str(text.clone()),
+        E::Int(v) => Engine::Int(*v),
+        E::Real(v) => Engine::Float(*v),
+        E::Bool(v) => Engine::Bool(*v),
+        E::Name(name) => Engine::Name(name.clone()),
+    }
+}
+
+/// Converts the engine's `EngineData` tree to the fork's value type.
+fn from_engine(value: &photocraft_text_re::engine_data::Value) -> E {
+    use photocraft_text_re::engine_data::Value as Engine;
+    match value {
+        Engine::Dict(items) => E::Dict(items.iter().map(|(key, value)| (key.clone(), from_engine(value))).collect()),
+        Engine::Array(items) => E::Array(items.iter().map(from_engine).collect()),
+        Engine::Str(text) => E::String(text.clone()),
+        Engine::Int(v) => E::Int(*v),
+        Engine::Float(v) => E::Real(*v),
+        Engine::Bool(v) => E::Bool(*v),
+        Engine::Name(name) => E::Name(name.clone()),
+    }
 }

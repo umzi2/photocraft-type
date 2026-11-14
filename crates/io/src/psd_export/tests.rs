@@ -842,3 +842,70 @@ fn a_cancelled_save_stops_between_the_bands_of_a_layer() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A preserved `TySh` whose `Ornt` summary says horizontal while the model is vertical (an
+/// older build wrote that on vertical text) makes Photoshop refuse the document with
+/// "Could not complete your request because of a program error". The export rewrites only the
+/// summary and keeps the block's other bytes.
+#[test]
+fn a_preserved_tysh_gets_the_model_orientation() {
+    use photocraft_doc::text::{CharStyle, Orientation, TextRun};
+    let mut doc = document(400, 200);
+    let mut t = photocraft_doc::TextLayer {
+        text: "Vertical".into(),
+        runs: vec![TextRun { len: 8, style: CharStyle { size_pt: 24.0, ..Default::default() } }],
+        orientation: Orientation::Vertical,
+        ..Default::default()
+    };
+    let good = photocraft_text::psd::build_tysh(&t, 72.0, None);
+    let mut ty = photocraft_psd::TySh::from_bytes(&good).unwrap();
+    ty.set_orientation(photocraft_psd::text_layer::Orientation::Horizontal);
+    t.psd_raw = Some(std::sync::Arc::new(ty.to_bytes()));
+    doc.layers.push(Layer::new("V", LayerContent::Text(t)));
+    let file = document_to_psd(&doc).unwrap();
+    let back = PsdFile::from_bytes(&file.to_bytes().unwrap()).unwrap();
+    let tysh = back.text_layer_tysh(0).unwrap().unwrap();
+    assert_eq!(
+        tysh.orientation(),
+        photocraft_psd::text_layer::Orientation::Vertical,
+        "the summary must follow the model"
+    );
+    // The same document keeps its `Txt2` template when its blocks agree with the model, and
+    // drops it when a block's summary disagrees: Photoshop rejects the block of that older
+    // writer, and the engine data lets it rebuild the block on open.
+    let mut doc2 = document(400, 200);
+    let mut t2 = photocraft_doc::TextLayer {
+        text: "Vertical".into(),
+        runs: vec![TextRun { len: 8, style: CharStyle { size_pt: 24.0, ..Default::default() } }],
+        orientation: Orientation::Vertical,
+        ..Default::default()
+    };
+    let stale = {
+        let mut ty = photocraft_psd::TySh::from_bytes(&photocraft_text::psd::build_tysh(&t2, 72.0, None)).unwrap();
+        ty.set_orientation(photocraft_psd::text_layer::Orientation::Horizontal);
+        std::sync::Arc::new(ty.to_bytes())
+    };
+    t2.psd_raw = Some(stale);
+    doc2.metadata.psd_global_blocks = vec![(*b"8BIM", *b"Txt2", std::sync::Arc::new(b"<< /1 << /1 [ ] >> >>".to_vec()))];
+    doc2.layers.push(Layer::new("V", LayerContent::Text(t2)));
+    let file = document_to_psd(&doc2).unwrap();
+    // The stale template is not carried over: the save writes a fresh block from the model and
+    // Photoshop's scaffolding (a block with only a frame list and objects is refused at open).
+    let block = file.global_blocks.iter().find(|b| b.key == *b"Txt2").expect("a fresh Txt2");
+    assert_ne!(block.data.as_slice(), b"<< /1 << /1 [ ] >> >>", "the stale template must not be carried");
+    assert!(photocraft_text::psd::txt2_is_valid(&block.data), "the fresh block is one Photoshop opens");
+    // A horizontal layer keeps its horizontal summary.
+    let mut h = photocraft_doc::TextLayer {
+        text: "Horizontal".into(),
+        runs: vec![TextRun { len: 10, style: CharStyle { size_pt: 24.0, ..Default::default() } }],
+        ..Default::default()
+    };
+    let raw = photocraft_text::psd::build_tysh(&h, 72.0, None);
+    h.psd_raw = Some(std::sync::Arc::new(raw));
+    let mut doc = document(400, 200);
+    doc.layers.push(Layer::new("H", LayerContent::Text(h)));
+    let file = document_to_psd(&doc).unwrap();
+    let back = PsdFile::from_bytes(&file.to_bytes().unwrap()).unwrap();
+    let tysh = back.text_layer_tysh(0).unwrap().unwrap();
+    assert_eq!(tysh.orientation(), photocraft_psd::text_layer::Orientation::Horizontal);
+}

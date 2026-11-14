@@ -404,3 +404,19 @@ fn manual_kerning_runs_along_the_column() {
     let gap = |l: &crate::TextLayout| l.glyphs[3].y - l.glyphs[2].y;
     assert!((gap(&k) - gap(&plain)).abs() < 1e-3);
 }
+
+/// A `TySh` `Ornt` that disagrees with the engine data must not flip the import: the user's
+/// broken file carried `Ornt = Hrzn` under `WritingDirection 2` (vertical), Photoshop refuses
+/// that pair, and the composer's direction is what the reader trusts.
+#[test]
+fn stale_ornt_does_not_flip_a_vertical_import() {
+    use photocraft_psd::text_layer::{Orientation as PsdOrientation, TySh};
+    let layer = vertical("Vertical", "Inter", 30.0);
+    let tysh = crate::psd::build_tysh(&layer, 72.0, None);
+    let mut parsed = TySh::from_bytes(&tysh).expect("parse");
+    assert_eq!(parsed.orientation(), PsdOrientation::Vertical);
+    // What the older writer produced: horizontal summary, vertical engine data.
+    parsed.set_orientation(PsdOrientation::Horizontal);
+    let back = crate::psd::text_layer_from_tysh(&parsed.to_bytes(), 72.0).expect("import");
+    assert_eq!(back.orientation, Orientation::Vertical, "the engine data must win");
+}

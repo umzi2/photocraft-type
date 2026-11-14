@@ -124,3 +124,93 @@ fn refresh_text_layers(doc: &Arc<photocraft_doc::Document>, ids: &[LayerId]) -> 
     }
     changed.then_some(out)
 }
+
+#[cfg(test)]
+mod refresh_damage_tests {
+    use super::*;
+    use crate::TypeLayerRef;
+    use photocraft_color::{ColorMode, SampleType};
+    use photocraft_doc::text::{CharStyle, TextRun};
+    use photocraft_doc::{Document, Layer, LayerContent, TextLayer};
+    use photocraft_geom::{Affine, Rect, Size};
+
+    /// Re-rendering a type layer's cache (a font that arrived after the open, a type edit) must
+    /// repaint the union of where the old and the new glyphs are, or the old ones stay on screen
+    /// beside the new ones (ghosting). The refresh keeps the file's `TySh` data, so the step can
+    /// differ only in the cache: the narrower path.
+    #[test]
+    fn a_refreshed_type_cache_damages_the_union_of_old_and_new_pixels() {
+        let mut doc = Document::with_background("t", Size::new(320, 200), ColorMode::Rgb, SampleType::U8, photocraft_doc::Color::WHITE);
+        let mut text = TextLayer {
+            text: "Wg".into(),
+            runs: vec![TextRun { len: 2, style: CharStyle { font_family: "Inter".into(), size_pt: 48.0, ..Default::default() } }],
+            transform: Affine::translate(30.0, 140.0),
+            ..Default::default()
+        };
+        text.sync_summary();
+        crate::cmd::type_cmds::refresh_at(doc.resolution_dpi, doc.pixel_format(), &mut text);
+        let fresh = text.cache.as_ref().expect("rendered").content_bounds();
+        assert!(!fresh.is_empty());
+        // What a PSD used to open with: Photoshop's pixels, here somewhere else entirely.
+        let mut stale = photocraft_raster::Surface::new(doc.pixel_format());
+        let stale_rect = Rect::new(5, 5, 100, 60);
+        stale.fill_rect(stale_rect, &[0.0, 0.0, 0.0, 1.0]);
+        text.cache = Some(stale);
+        let raw = text.psd_raw.clone();
+        let layer = Layer::new("type", LayerContent::Text(text.clone()));
+        let id = layer.id;
+        doc.layers.push(layer);
+
+        let mut s = Session::new();
+        s.add_document(doc, None);
+        let doc_id = s.active().unwrap().doc.id;
+        s.refresh_type_layers(&[TypeLayerRef { doc: doc_id, layer: id, first_snapshot: false }]);
+
+        let st = s.active().unwrap();
+        let LayerContent::Text(t) = &st.doc.layer(id).unwrap().content else { panic!("not a type layer") };
+        assert_eq!(t.cache.as_ref().map(|c| c.content_bounds()), Some(fresh), "the cache is the model's render again");
+        assert!(t.psd_raw.as_ref().zip(raw.as_ref()).is_some_and(|(a, b)| a.as_slice() == b.as_slice()), "the TySh data is unchanged");
+        let want = stale_rect.union(&fresh);
+        let damage = st.last_damage.expect("a bounded damage");
+        assert_eq!(damage.intersect(&want), want, "damage {damage:?} must repaint the old {stale_rect:?} and new {fresh:?} glyphs");
+    }
+
+    /// Entering text edit on a type layer whose cache is not the model's render (an imported
+    /// raster, a font change) replaces it through `type.edit`, the command the Type tool runs
+    /// first. The canvas must repaint the union of the old and the new glyphs and the layer must
+    /// end with the model's render alone: anything else leaves the old text visible under the
+    /// new one (the user's duplicate-and-edit ghost).
+    #[test]
+    fn entering_text_edit_on_a_stale_cache_draws_the_model_only() {
+        let mut doc = Document::with_background("t", Size::new(320, 200), ColorMode::Rgb, SampleType::U8, photocraft_doc::Color::WHITE);
+        let mut text = TextLayer {
+            text: "Wg".into(),
+            runs: vec![TextRun { len: 2, style: CharStyle { font_family: "Inter".into(), size_pt: 48.0, ..Default::default() } }],
+            transform: Affine::translate(30.0, 140.0),
+            ..Default::default()
+        };
+        text.sync_summary();
+        crate::cmd::type_cmds::refresh_at(doc.resolution_dpi, doc.pixel_format(), &mut text);
+        let fresh = text.cache.as_ref().expect("rendered").content_bounds();
+        let mut stale = photocraft_raster::Surface::new(doc.pixel_format());
+        let stale_rect = Rect::new(5, 5, 100, 60);
+        stale.fill_rect(stale_rect, &[0.0, 0.0, 0.0, 1.0]);
+        text.cache = Some(stale);
+        let layer = Layer::new("type", LayerContent::Text(text));
+        let id = layer.id;
+        doc.layers.push(layer);
+        let mut s = Session::new();
+        s.add_document(doc, None);
+        s.select_layer(id).unwrap();
+        s.execute("type.edit", serde_json::json!({ "layer": id })).expect("entering edit re-renders the layer");
+
+        let st = s.active().unwrap();
+        let LayerContent::Text(t) = &st.doc.layer(id).unwrap().content else { panic!("not a type layer") };
+        assert_eq!(t.cache.as_ref().map(|c| c.content_bounds()), Some(fresh), "the layer must show the model's render only");
+        let old = t.cache.as_ref().unwrap().pixel(stale_rect.x0, stale_rect.y0);
+        assert_eq!(old[3], 0.0, "the stale pixel {old:?} is gone");
+        let want = stale_rect.union(&fresh);
+        let damage = st.last_damage.expect("a bounded damage");
+        assert_eq!(damage.intersect(&want), want, "damage {damage:?} must repaint the old {stale_rect:?} and new {fresh:?} glyphs");
+    }
+}

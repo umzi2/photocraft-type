@@ -49,8 +49,15 @@ fn coverage(doc: &Document, t: &TextLayer) -> Result<(Vec<f32>, Rect)> {
     for r in &mut t.runs {
         r.style.color.alpha = 1.0;
     }
-    let mut eng = photocraft_text::shared().lock().unwrap_or_else(|e| e.into_inner());
-    let surface = eng.render(&t, doc.resolution_dpi, doc.pixel_format()).1.surface;
+    // The same pixels the layer's cache gets: the reimplemented engine when it draws the layer,
+    // the built-in renderer otherwise (`refresh_at`'s order), so a Type Mask always selects the
+    // glyph coverage the canvas shows.
+    let (dpi, format) = (doc.resolution_dpi, doc.pixel_format());
+    let txt2 = crate::type_cmds::txt2_block(doc);
+    let surface = crate::type_cmds::render_with_reimplementation(&t, dpi, format, txt2.as_deref().map(Vec::as_slice), None).unwrap_or_else(|()| {
+        let mut eng = photocraft_text::shared().lock().unwrap_or_else(|e| e.into_inner());
+        eng.render(&t, dpi, format).1.surface
+    });
     let area = surface.content_bounds();
     if area.is_empty() {
         return Ok((Vec::new(), Rect::EMPTY));

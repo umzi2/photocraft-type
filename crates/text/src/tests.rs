@@ -3,6 +3,7 @@ use photocraft_doc::TextLayer;
 use photocraft_doc::text::{AntiAlias, Caps, CharStyle, FontFeature, Orientation, ParagraphRun, ParagraphStyle, TextAlign, TextDirection, TextRun, TextShape};
 use photocraft_geom::Affine;
 
+use crate::engine_data::Value as E;
 use crate::{TextEngine, fonts};
 
 fn point(text: &str, size_pt: f32) -> TextLayer {
@@ -1132,31 +1133,188 @@ fn build_txt2_round_trips_kerning_modes() {
     assert_eq!(modes, vec![(1, Kerning::Off), (1, Kerning::Metrics)]);
 }
 
-/// #3514 / #10308: the document `Txt2` is needed for Optical kerning and for OpenType settings
-/// EngineData can't carry (stylistic sets, swashes, …). A fresh document of ordinary Metrics text
-/// must not write Photoshop's empty stub, which some readers (Photopea) reject.
+/// Hanging punctuation (`ParagraphStyle::hanging_punctuation`): the measured Roman set of
+/// Photoshop 20.0.2 shifts a paragraph-initial quote into the margin by its whole advance,
+/// leaves the following glyph where it was, and keeps the text's end position.
 #[test]
-fn needs_txt2_for_optical_and_txt2_only_opentype() {
-    use photocraft_doc::text::{FontFeature, Kerning};
-    let style = |kerning: Kerning| CharStyle { kerning, ..Default::default() };
-    let metrics = runs_of("AV", &[(2, style(Kerning::Metrics))]);
-    assert!(!crate::psd::needs_txt2(&[(0, &metrics)]));
-    let off = runs_of("AV", &[(2, style(Kerning::Off))]);
-    assert!(!crate::psd::needs_txt2(&[(0, &off)]), "Off lives in EngineData, not Txt2");
-    let optical = runs_of("AV", &[(1, style(Kerning::Optical)), (1, CharStyle::default())]);
-    assert!(crate::psd::needs_txt2(&[(0, &optical)]));
-    assert!(!crate::psd::needs_txt2(&[]));
-    let with_ss = |tag: &str, value: u16| {
-        let mut s = style(Kerning::Metrics);
-        s.features = vec![FontFeature { tag: tag.into(), value }];
-        runs_of("AV", &[(2, s)])
+fn hanging_punctuation_shifts_the_line_prefix_into_the_margin() {
+    let mut engine = TextEngine::new();
+    let style = |hanging: bool| ParagraphStyle { hanging_punctuation: hanging, ..Default::default() };
+    let layer = |hanging: bool| {
+        let mut t = point("\u{201C}Hello\u{201D}", 24.0);
+        t.paragraphs = vec![ParagraphRun { len: t.text.len(), style: style(hanging) }];
+        t
     };
-    assert!(crate::psd::needs_txt2(&[(0, &with_ss("ss01", 1))]), "stylistic set 1 lives only in Txt2");
-    assert!(crate::psd::needs_txt2(&[(0, &with_ss("ss05", 1))]), "stylistic set 5 lives only in Txt2");
-    assert!(!crate::psd::needs_txt2(&[(0, &with_ss("ss01", 0))]), "an off set is the default");
-    assert!(crate::psd::needs_txt2(&[(0, &with_ss("swsh", 1))]), "swash lives only in Txt2");
-    assert!(crate::psd::needs_txt2(&[(0, &with_ss("calt", 0))]), "calt off is Txt2-only");
-    assert!(!crate::psd::needs_txt2(&[(0, &with_ss("calt", 1))]), "calt on is the default");
+    let plain = engine.layout(&layer(false), 72.0);
+    let hanging = engine.layout(&layer(true), 72.0);
+    assert!(plain.glyphs.len() >= 3 && hanging.glyphs.len() == plain.glyphs.len());
+    // The opening quote hangs by its advance; it is a 0.0-flow glyph in the measured table.
+    let quote = plain.glyphs[0].x - hanging.glyphs[0].x;
+    assert!(quote > 4.0, "the quote hangs into the margin: {quote}");
+    // The content after it does not move, and neither does the line's end.
+    assert!((plain.glyphs[1].x - hanging.glyphs[1].x).abs() < 0.01, "content keeps the margin");
+    let last = plain.glyphs.len() - 1;
+    assert!((plain.glyphs[last].x - hanging.glyphs[last].x).abs() < 0.01, "the text end stays");
+    // The line's reported start includes the overhang; a line of only punctuation keeps its
+    // normal start, and hanging off is byte-identical to today's layout.
+    assert!(hanging.lines[0].x0 < plain.lines[0].x0 - 4.0, "x0 includes the hanging prefix");
+    let mut only = point("\u{2026}", 24.0);
+    only.paragraphs = vec![ParagraphRun { len: only.text.len(), style: style(true) }];
+    let single = engine.layout(&only, 72.0);
+    assert!(single.lines[0].x0 >= 0.0, "a line made only of hanging punctuation keeps its start");
+}
+
+/// The left overhang is only for lines that start at the left text edge: a centred line's start
+/// is inside the box, so its leading punctuation does not move (the right side of a line, where
+/// Photoshop hangs closing punctuation for centred/right-aligned text, is not implemented yet).
+#[test]
+fn hanging_punctuation_leaves_a_centred_line_start_alone() {
+    let mut engine = TextEngine::new();
+    let style = |hanging: bool| ParagraphStyle { hanging_punctuation: hanging, align: TextAlign::Center, ..Default::default() };
+    let layer = |hanging: bool| {
+        let mut t = point("\u{201C}Hi", 24.0);
+        t.shape = TextShape::Box { x: 0.0, y: 0.0, width: 220.0, height: 90.0 };
+        t.paragraphs = vec![ParagraphRun { len: t.text.len(), style: style(hanging) }];
+        t
+    };
+    let plain = engine.layout(&layer(false), 72.0);
+    let hanging = engine.layout(&layer(true), 72.0);
+    assert!(plain.glyphs.len() >= 3 && hanging.glyphs.len() == plain.glyphs.len());
+    assert!((plain.glyphs[0].x - hanging.glyphs[0].x).abs() < 0.01, "a centred line keeps its start");
+    assert!((plain.lines[0].x0 - hanging.lines[0].x0).abs() < 0.01, "x0 keeps the centred offset");
+}
+
+/// The paragraph-panel depth round-trips through `EngineData`: justification, every indent and
+/// space, auto leading, hyphenation numbers, hanging punctuation, the composer and CJK options.
+#[test]
+fn engine_data_round_trips_paragraph_depth() {
+    use photocraft_doc::text::{ParagraphRun, ParagraphStyle, TextAlign};
+    let deep = ParagraphStyle {
+        align: TextAlign::JustifyAll,
+        first_line_indent_pt: 6.0,
+        start_indent_pt: 3.0,
+        end_indent_pt: 4.0,
+        space_before_pt: 5.0,
+        space_after_pt: 7.0,
+        auto_leading: 1.5,
+        hyphenate: true,
+        hanging_punctuation: true,
+        every_line_composer: true,
+        burasagari: true,
+        kinsoku_order: 2,
+        hyphenate_word_size: 8,
+        hyphenate_min_before: 3,
+        hyphenate_min_after: 4,
+        hyphen_limit: 2,
+        hyphenation_zone_pt: 18.0,
+        hyphenate_capitalized: true,
+        justification_word: [0.7, 0.9, 1.2],
+        justification_letter: [-0.1, 0.0, 0.1],
+        justification_glyph: [0.95, 1.0, 1.05],
+        ..Default::default()
+    };
+    let plain = ParagraphStyle { align: TextAlign::Right, space_after_pt: 2.0, ..Default::default() };
+    let mut t = point("One\nTwo", 12.0);
+    t.paragraphs = vec![ParagraphRun { len: 4, style: deep.clone() }, ParagraphRun { len: 3, style: plain.clone() }];
+    let tysh = crate::psd::build_tysh(&t, 72.0, None);
+    let mut back = crate::psd::text_layer_from_tysh(&tysh, 72.0).unwrap();
+    let styles: Vec<ParagraphStyle> = back.paragraph_runs().into_iter().map(|r| r.style.clone()).collect();
+    assert_eq!(styles, vec![deep, plain]);
+    // The value `Txt2` alone carries: EngineData has no key for it, so it stays the default
+    // until `apply_txt2` reads `/5/15`.
+    assert!(back.paragraph_runs()[0].style.hyphenate_capitalized);
+    back.paragraphs[0].style.hyphenate_capitalized = false;
+    let txt2 = crate::psd::parse_txt2(&crate::psd::build_txt2(&[(0, &back)], None)).unwrap();
+    let mut from_psd = crate::psd::text_layer_from_tysh(&tysh, 72.0).unwrap();
+    let tysh = with_text_index(&tysh, 0);
+    crate::psd::apply_txt2(&mut from_psd, &tysh, &txt2);
+    assert!(!from_psd.paragraph_runs()[0].style.hyphenate_capitalized, "/5/15 is Txt2-only");
+}
+
+/// `Txt2` carries the paragraph sheet Photoshop's composer reads: one run per paragraph (UTF-16
+/// lengths, the final one covers the terminal `\r`) with the paragraph properties in `/5`.
+#[test]
+fn build_txt2_writes_paragraph_sheets() {
+    use photocraft_doc::text::{ParagraphRun, ParagraphStyle, TextAlign};
+    let first = ParagraphStyle {
+        align: TextAlign::JustifyAll,
+        first_line_indent_pt: 24.0,
+        start_indent_pt: 12.0,
+        end_indent_pt: 6.0,
+        space_before_pt: 9.0,
+        space_after_pt: 10.0,
+        auto_leading: 1.4,
+        hyphenate: true,
+        hanging_punctuation: true,
+        every_line_composer: true,
+        hyphenate_word_size: 7,
+        hyphenate_min_before: 3,
+        hyphenate_min_after: 4,
+        hyphen_limit: 2,
+        hyphenation_zone_pt: 18.0,
+        hyphenate_capitalized: false,
+        justification_word: [0.8, 1.0, 1.33],
+        justification_letter: [0.0, 0.0, 0.0],
+        justification_glyph: [1.0, 1.0, 1.0],
+        ..Default::default()
+    };
+    // The emoji is two UTF-16 code units: the run length must count code units, not bytes.
+    let mut t = point("a\u{1F600}\nb", 12.0);
+    let first_len = "a\u{1F600}\n".len();
+    t.paragraphs = vec![ParagraphRun { len: first_len, style: first }, ParagraphRun { len: 1, style: ParagraphStyle::default() }];
+    let txt2 = crate::psd::parse_txt2(&crate::psd::build_txt2(&[(0, &t)], None)).unwrap();
+    let object = txt2.path(&["1", "1"]).and_then(E::as_array).and_then(<[E]>::first).expect("the object");
+    let runs = object.path(&["0", "5", "0"]).and_then(E::as_array).expect("paragraph runs");
+    assert_eq!(runs.len(), 2);
+    let lens: Vec<i64> = runs.iter().filter_map(|r| r.get("1").and_then(E::as_i64)).collect();
+    assert_eq!(lens, vec![4, 2], "UTF-16 lengths: a+emoji+CR is 4, b+CR is 2");
+    assert!(runs[0].path(&["0", "0", "5"]).is_some(), "Photoshop's nested paragraph run: {:?}", runs[0]);
+    let sheet = runs[0].path(&["0", "0", "5"]).or_else(|| runs[0].path(&["0", "5"])).expect("paragraph sheet");
+    // Photoshop's paragraph code space is shared by `Txt2` and `EngineData`:
+    // 5 = justify all, 6 = justify-last-left (the same table the reader's
+    // `Justification::from_psd` uses). `JustifyAll` is 5; the pre-migration
+    // writer's `para_align_code` shifted the justified modes by one.
+    assert_eq!(sheet.get("0").and_then(E::as_i64), Some(5), "fully justified");
+    assert_eq!(sheet.get("1").and_then(E::as_f64), Some(24.0));
+    assert_eq!(sheet.get("2").and_then(E::as_f64), Some(12.0));
+    assert_eq!(sheet.get("3").and_then(E::as_f64), Some(6.0));
+    assert_eq!(sheet.get("4").and_then(E::as_f64), Some(9.0));
+    assert_eq!(sheet.get("5").and_then(E::as_f64), Some(10.0));
+    assert_eq!(sheet.get("7").and_then(E::as_f64), Some(1.4));
+    assert_eq!(sheet.get("9").and_then(E::as_bool), Some(true));
+    assert_eq!(sheet.get("10").and_then(E::as_i64), Some(7));
+    assert_eq!(sheet.get("11").and_then(E::as_i64), Some(3));
+    assert_eq!(sheet.get("12").and_then(E::as_i64), Some(4));
+    assert_eq!(sheet.get("13").and_then(E::as_i64), Some(2));
+    assert_eq!(sheet.get("14").and_then(E::as_f64), Some(18.0));
+    assert_eq!(sheet.get("15").and_then(E::as_bool), Some(false));
+    assert_eq!(sheet.get("21").and_then(E::as_bool), Some(true));
+    assert_eq!(sheet.get("29").and_then(E::as_bool), Some(true));
+    let second = runs[1].path(&["0", "0", "5"]).or_else(|| runs[1].path(&["0", "5"])).expect("default paragraph sheet");
+    assert_eq!(second.get("0").and_then(E::as_i64), Some(0));
+    assert_eq!(second.get("9").and_then(E::as_bool), Some(false));
+    // Photoshop's own copy stays intact: no hyphenation keys are added while it is off.
+    assert!(second.get("10").is_none());
+}
+
+/// Rewriting a document whose layers did not change must not touch the `Txt2` paragraph runs
+/// (the writer promises a byte-for-byte block for an unchanged save).
+#[test]
+fn build_txt2_paragraph_sheets_are_stable() {
+    use photocraft_doc::text::{ParagraphRun, ParagraphStyle, TextAlign};
+    let style = ParagraphStyle {
+        align: TextAlign::Center,
+        first_line_indent_pt: 4.0,
+        hanging_punctuation: true,
+        every_line_composer: true,
+        justification_word: [0.9, 1.0, 1.1],
+        ..Default::default()
+    };
+    let mut t = point("One two\nThree", 12.0);
+    t.paragraphs = vec![ParagraphRun { len: 8, style }, ParagraphRun { len: 5, style: ParagraphStyle::default() }];
+    let first = crate::psd::build_txt2(&[(0, &t)], None);
+    let second = crate::psd::build_txt2(&[(0, &t)], Some(&first));
+    assert_eq!(first, second, "an unchanged paragraph style must keep the block byte for byte");
 }
 
 /// #10308: the fresh objects, minimal style runs, seeded font list and frame list are only for a
@@ -1197,6 +1355,57 @@ fn fresh_native_txt2_object_has_a_paragraph_run_per_paragraph() {
         object.path(&["0", "5", "0"]).and_then(E::as_array).expect("paragraph runs").iter().filter_map(|r| r.get("1").and_then(E::as_i64)).collect();
     assert_eq!(lens, vec![3, 5]);
     assert_eq!(out.path(&["0", "8", "0"]).and_then(E::as_array).map(<[E]>::len), Some(1), "a native block names one frame");
+}
+
+/// Photoshop's composer reads a `Txt2` style run only when its wrapper carries `/5 1` (the
+/// character-run marker). A native object written without it was composed by Photoshop with the
+/// shared default character sheet — 12 pt black — so a 72 pt red layer jumped to the wrong size
+/// and colour as soon as Photoshop recomposed it (measured with `psx_recompose.jsx`: 392x238 px
+/// and #F80000 ink became 65x40 px and black).
+#[test]
+fn native_txt2_style_runs_carry_the_character_run_marker() {
+    use crate::engine_data::Value as E;
+    let red = CharStyle { size_pt: 72.0, color: Color::rgb(0.9725, 0.0, 0.0), ..Default::default() };
+    let t = runs_of("Hi", &[(2, red)]);
+    let out = crate::psd::parse_txt2(&crate::psd::build_txt2(&[(0, &t)], None)).unwrap();
+    let object = out.path(&["1", "1"]).and_then(E::as_array).and_then(|a| a.first()).expect("the object");
+    let run = object.path(&["0", "6", "0"]).and_then(E::as_array).and_then(|a| a.first()).expect("a style run");
+    assert_eq!(run.path(&["0", "0", "5"]).and_then(E::as_i64), Some(1), "the character-run marker: {run:?}");
+    assert_eq!(run.path(&["0", "0", "6", "1"]).and_then(E::as_f64), Some(72.0), "size in the sheet");
+    let fill = run.path(&["0", "0", "6", "53", "0", "1"]).and_then(E::as_array).expect("the fill colour");
+    assert_eq!(fill.first().and_then(E::as_f64), Some(1.0), "alpha first: {fill:?}");
+    assert!((fill.get(1).and_then(E::as_f64).unwrap_or(0.0) - 0.9725).abs() < 1e-4, "red channel: {fill:?}");
+}
+
+/// An object a previous save wrote without the marker (every native layer the earlier build
+/// saved) is refitted on the next save, so opening and re-saving such a file repairs it.
+#[test]
+fn txt2_repairs_style_runs_missing_the_character_run_marker() {
+    use crate::engine_data::Value as E;
+    let t = runs_of("Hi", &[(2, CharStyle { size_pt: 72.0, ..Default::default() })]);
+    // A native-style block whose style run lacks `/5 1`, as the broken build wrote it.
+    let style = E::Dict(vec![("0".into(), E::Int(0)), ("1".into(), E::Real(72.0)), ("11".into(), E::Int(1))]);
+    let data = E::Dict(vec![("0".into(), E::String(String::new())), ("6".into(), style)]);
+    let object = E::Dict(vec![
+        (
+            "0".into(),
+            E::Dict(vec![
+                ("0".into(), E::String("Hi\r".into())),
+                ("5".into(), E::Dict(vec![("0".into(), E::Array(vec![]))])),
+                ("6".into(), E::Dict(vec![("0".into(), E::Array(vec![E::Dict(vec![("0".into(), E::Dict(vec![("0".into(), data)]))])]))])),
+            ]),
+        ),
+        ("1".into(), E::Dict(vec![("0".into(), E::Array(vec![E::Dict(vec![("0".into(), E::Int(0))])]))])),
+    ]);
+    let fonts = E::Array(vec![E::Dict(vec![("0".into(), E::String("TimesNewRomanPSMT".into())), ("2".into(), E::Int(0))])]);
+    let prev = crate::engine_data::write_bare(&[
+        ("0".into(), E::Dict(vec![("1".into(), E::Dict(vec![("0".into(), fonts)]))])),
+        ("1".into(), E::Dict(vec![("1".into(), E::Array(vec![object]))])),
+    ]);
+    let out = crate::psd::parse_txt2(&crate::psd::build_txt2(&[(0, &t)], Some(&prev))).unwrap();
+    let object = out.path(&["1", "1"]).and_then(E::as_array).and_then(|a| a.first()).expect("the object");
+    let run = object.path(&["0", "6", "0"]).and_then(E::as_array).and_then(|a| a.first()).expect("a style run");
+    assert_eq!(run.path(&["0", "0", "5"]).and_then(E::as_i64), Some(1), "repaired: {run:?}");
 }
 
 /// A kept `Txt2` object — same text, so its extras are still true — keeps everything the file
@@ -1438,6 +1647,30 @@ fn a_text_index_beyond_the_photoshop_era_entries_grows_nothing() {
 /// (`/0`, `/1 /0`, `/1 /2`), style runs carrying a full style (font, size, leading) besides the
 /// auto-kern mode, a Latin-1 string without a byte-order mark, reals, and a second object no
 /// layer names. `modes` are the object's `(UTF-16 length, auto-kern mode)` runs for "AVA\r".
+/// A block that carries Photoshop's scaffolding: CoolType refuses a numbered block without
+/// `/0 /5`, `/0 /6` and `/1 /0` ("General Photoshop error"), so the writer rebuilds such a block
+/// from the native scaffold instead of preserving it. Fixtures that model a *Photoshop* block
+/// therefore get the scaffolding keys the native block has (and Photoshop's ascending key order).
+fn with_scaffolding(block: Vec<u8>) -> Vec<u8> {
+    use crate::engine_data::Value as E;
+    let E::Dict(mut top) = crate::psd::parse_txt2(&block).expect("fixture parses") else { panic!("fixture is a dict") };
+    let E::Dict(scaffold) = crate::psd::parse_txt2(include_bytes!("psd/native_txt2.ps")).expect("scaffold parses") else { panic!("scaffold is a dict") };
+    for (key, extra) in [("0", vec!["5", "6"]), ("1", vec!["0", "2", "3"])] {
+        let Some(E::Dict(native)) = scaffold.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()) else { continue };
+        let Some(E::Dict(items)) = top.iter_mut().find(|(k, _)| k == key).map(|(_, v)| v) else { continue };
+        for want in extra {
+            if items.iter().any(|(k, _)| k == want) {
+                continue;
+            }
+            if let Some((k, v)) = native.iter().find(|(k, _)| k == want) {
+                items.push((k.clone(), v.clone()));
+            }
+        }
+        items.sort_by_key(|(k, _)| k.parse::<u32>().unwrap_or(u32::MAX));
+    }
+    crate::engine_data::write_bare(&top)
+}
+
 fn photoshop_txt2(modes: &[(usize, i64)]) -> Vec<u8> {
     let mut v = b"\n\n/98 << /0 14 >> /0 << /1 << /0 [ << /0 << /0 (MyriadPro-Regular) /2 0 >> >> ] >> >> /1 << /0 << /0 1 /1 .5 >> /1 [ << /0 << /0 (\xfe\xff\0A\0V\0A\0\r) /6 << /0 [ ".to_vec();
     for (len, m) in modes {
@@ -1446,7 +1679,7 @@ fn photoshop_txt2(modes: &[(usize, i64)]) -> Vec<u8> {
     v.extend_from_slice(
         b"] >> /7 << /0 1 >> >> /21 << /1 [ 1.25 2.5 ] >> >> << /0 << /0 (\xfe\xff\0B\0\r) >> /21 << /1 [ 3.0 ] >> >> ] /2 << /0 7 >> >> /3 << /0 .25 >>",
     );
-    v
+    with_scaffolding(v)
 }
 
 /// #2374: an unedited save hands Photoshop back its own `Txt2`, byte for byte. Rebuilding it
@@ -1533,14 +1766,23 @@ fn edited_text_keeps_the_files_txt2_object() {
     {
         let t = runs_of(text, &[(text.len(), CharStyle::default())]);
         let out = crate::psd::parse_txt2(&crate::psd::build_txt2(&[(0, &t)], Some(&prev))).unwrap();
-        for key in [&["0"][..], &["98"], &["1", "0"], &["1", "2"]] {
+        // The file's own `/0` keys survive; the scaffolding keys CoolType needs (`/0 /5`,
+        // `/0 /6`) are added because this fixture is a native block without them.
+        for key in [&["0", "8"][..], &["98"], &["1", "0"], &["1", "2"]] {
             assert_eq!(out.path(key), before.path(key), "{text:?}: /{} survives", key.join(" /"));
+        }
+        for key in [&["0", "5"][..], &["0", "6"]] {
+            assert!(out.path(key).is_some(), "{text:?}: /{} is added", key.join(" /"));
         }
         let object = &out.path(&["1", "1"]).and_then(E::as_array).unwrap()[0];
         let engine = format!("{}\r", text.replace('\n', "\r"));
         let total = engine.encode_utf16().count() as i64;
         assert_eq!(object.path(&["0", "0"]).and_then(E::as_str), Some(engine.as_str()));
-        assert_eq!(object.get("1"), before_object.get("1"), "{text:?}: the view (its frame) is kept");
+        let view = object.get("1").expect("the view");
+        assert_eq!(view.get("0"), before_object.get("1").and_then(|v| v.get("0")), "{text:?}: the view's frame is kept");
+        // The view's composed-layout cache (its strikes, whose glyph runs carry the old text's
+        // gids) is cleared: Photoshop would otherwise render the stored glyphs of the old text.
+        assert_eq!(view.get("2"), Some(&E::Array(vec![])), "{text:?}: the stale composed cache is cleared");
         assert!(object.get("21").is_none(), "{text:?}: pen positions of the old text are dropped");
         assert_eq!(lens(object, "5"), paragraphs, "{text:?}: one paragraph run per paragraph");
         // Photoshop reads the character style from these runs: they follow the layer's own runs
@@ -1640,11 +1882,10 @@ fn new_text_layer_gets_a_txt2_object_and_frame() {
     assert_eq!(object.path(&["0", "0"]).and_then(E::as_str), Some("v1.0\r"));
     assert_eq!(object.path(&["1", "0"]), Some(&E::Array(vec![E::Dict(vec![("0".into(), E::Int(1))])])), "the view names its own frame");
     assert!(object.get("21").is_none());
-    assert_eq!(
-        object.path(&["1", "2"]).and_then(E::as_array).and_then(|s| s[0].get("6")).and_then(E::as_array).and_then(|f| f[0].get("10")),
-        Some(&E::Int(1)),
-        "the frame strike names its own frame"
-    );
+    // The new object carries no composed-layout cache copied from the template: its strikes are
+    // empty, so Photoshop composes the layer from the model instead of drawing the template's
+    // glyphs (the gids live in the strikes' `/G` runs).
+    assert_eq!(object.path(&["1", "2"]), Some(&E::Array(vec![])), "no stale composed cache");
     let lens =
         |path: &[&str]| -> Vec<i64> { object.path(path).and_then(E::as_array).unwrap().iter().map(|r| r.get("1").and_then(E::as_i64).unwrap()).collect() };
     assert_eq!(lens(&["0", "5", "0"]), vec![5]);
@@ -1705,6 +1946,71 @@ fn txt2_runs_that_dont_cover_the_text_are_regenerated() {
         assert_eq!(total, 4, "{modes:?}");
         assert!(out.path(&["1", "2"]).is_some());
     }
+}
+
+/// A `Txt2` object carries a composed-layout cache in its view (`/1 /2`): the rendered strikes,
+/// whose `/G` runs hold the gids of the text the file had. A layer the file has no object for
+/// takes a template object's shape; copying the template's cache handed Photoshop the template's
+/// glyphs for the new text, so the refitted object drops the cache (empty strikes) and Photoshop
+/// composes it from the model, while an object this save did not touch keeps its cache.
+#[test]
+fn a_new_object_drops_the_template_composed_cache() {
+    use crate::engine_data::Value as E;
+    fn d(items: Vec<(&str, E)>) -> E {
+        E::Dict(items.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+    }
+    let run = |len: i64, keys: Vec<(&str, E)>| d(vec![("0", d(keys)), ("1", E::Int(len))]);
+    let style = |len: i64| run(len, vec![("0", d(vec![("0", E::String(String::new())), ("6", d(vec![("0", E::Int(0)), ("1", E::Real(22.0))]))]))]);
+    let template = d(vec![
+        (
+            "0",
+            d(vec![
+                ("0", E::String("Hyphenation demonstration\r".into())),
+                ("5", d(vec![("0", E::Array(vec![run(26, vec![("0", d(vec![("0", E::String(String::new()))]))])]))])),
+                ("6", d(vec![("0", E::Array(vec![style(26)]))])),
+            ]),
+        ),
+        (
+            "1",
+            d(vec![
+                ("0", E::Array(vec![d(vec![("0", E::Int(0))])])),
+                ("1", d(vec![("0", E::Array(vec![run(26, vec![("0", d(vec![("1", E::Int(1))]))])]))])),
+                (
+                    "2",
+                    E::Array(vec![d(vec![
+                        ("99", E::Name("PC".into())),
+                        ("6", E::Array(vec![
+                            d(vec![("99", E::Name("F".into())), ("10", E::Int(0))]),
+                            d(vec![("99", E::Name("G".into())), ("5", E::Array(vec![E::Int(41), E::Int(54), E::Int(41)]))]),
+                        ])),
+                    ])]),
+                ),
+            ]),
+        ),
+    ]);
+    let frames = d(vec![("8", d(vec![("0", E::Array(vec![crate::psd_path::point_frame(), crate::psd_path::point_frame()]))]))]);
+    let prev = crate::engine_data::write_bare(&[
+        ("0".into(), frames),
+        ("1".into(), d(vec![
+            ("0", d(vec![("0", E::Int(1))])),
+            ("1", E::Array(vec![template])),
+            ("2", d(vec![("0", E::Int(7))])),
+        ])),
+    ]);
+    let mut boxed = runs_of("New text", &[(8, CharStyle { size_pt: 22.0, ..Default::default() })]);
+    boxed.shape = TextShape::Box { x: 56.0, y: 52.0, width: 544.0, height: 308.0 };
+    let out = crate::psd::parse_txt2(&crate::psd::build_txt2(&[(1, &boxed)], Some(&prev))).unwrap();
+    let objects = out.path(&["1", "1"]).and_then(E::as_array).expect("the objects");
+    assert_eq!(objects.len(), 2, "the file's object and the new one");
+    let was = crate::psd::parse_txt2(&prev).unwrap();
+    let kept = &was.path(&["1", "1"]).and_then(E::as_array).unwrap()[0];
+    assert_eq!(objects[0].get("1"), kept.get("1"), "an untouched object keeps its cache byte for byte");
+    assert!(objects[0].path(&["1", "2"]).and_then(E::as_array).is_some_and(|s| !s.is_empty()), "the untouched object's strikes survive");
+    let object = &objects[1];
+    assert_eq!(object.path(&["0", "0"]).and_then(E::as_str), Some("New text\r"), "the new model text");
+    assert_eq!(object.path(&["1", "0"]), Some(&E::Array(vec![d(vec![("0", E::Int(1))])])), "the view names the new frame");
+    assert_eq!(object.path(&["1", "2"]), Some(&E::Array(vec![])), "the template's composed cache is not copied");
+    assert!(!format!("{object:?}").contains("\"G\""), "no template glyph runs reach the new object");
 }
 
 /// A file-controlled `TextIndex` must not size the save: out-of-range numbers are ignored (the
@@ -1921,7 +2227,7 @@ fn legacy_tysh_point_origin_imports_and_round_trips_on_canvas() {
 
         let mut imported = crate::psd::text_layer_from_tysh(&data, 72.0).unwrap();
         imported.psd_raw = Some(std::sync::Arc::new(data.clone()));
-        crate::psd::refine_legacy_point_origin(&mut imported, 72.0, &mut engine, None);
+        crate::psd::refine_legacy_point_origin(&mut imported, 72.0, &mut engine);
         assert_eq!(imported.paragraph_runs()[0].style.align, align);
         assert_transform_near(imported.transform, expected, 1e-6, &format!("{align:?}: anchor"));
 
@@ -1950,7 +2256,7 @@ fn legacy_tysh_point_origin_imports_and_round_trips_on_canvas() {
         with_frame.psd_raw = Some(std::sync::Arc::new(framed.clone()));
         crate::psd::apply_txt2_frame(&mut with_frame, &framed, &txt2);
         let authoritative = with_frame.transform;
-        crate::psd::refine_legacy_point_origin(&mut with_frame, 72.0, &mut engine, Some(&txt2));
+        crate::psd::refine_legacy_point_origin(&mut with_frame, 72.0, &mut engine);
         assert_eq!(with_frame.transform, authoritative, "{align:?}: exact frame wins");
     }
 }
@@ -1968,7 +2274,7 @@ fn legacy_origin_lines_up_ink_with_the_ink_bounding_box() {
         let data = legacy_tysh(&source, original, [8000.0, 8000.0], &mut engine);
         let mut imported = crate::psd::text_layer_from_tysh(&data, 72.0).unwrap();
         imported.psd_raw = Some(std::sync::Arc::new(data));
-        crate::psd::refine_legacy_point_origin(&mut imported, 72.0, &mut engine, None);
+        crate::psd::refine_legacy_point_origin(&mut imported, 72.0, &mut engine);
         let baseline = imported.transform.apply(photocraft_geom::Point::new(0.0, 0.0));
         assert!((baseline.x - 100.0).abs() < 1e-6 && (baseline.y - 450.0).abs() < 1e-6, "{text:?}: {baseline:?}");
     }
@@ -1988,7 +2294,7 @@ fn legacy_origin_uses_the_rendering_engines_registered_face() {
     imported.runs = source.runs.clone();
     imported.sync_summary();
     imported.psd_raw = Some(std::sync::Arc::new(raw));
-    crate::psd::refine_legacy_point_origin(&mut imported, 72.0, &mut engine, None);
+    crate::psd::refine_legacy_point_origin(&mut imported, 72.0, &mut engine);
     let placed = imported.transform.apply(photocraft_geom::Point::new(0.0, 0.0));
     assert!((placed.x - 100.0).abs() < 1e-6 && (placed.y - 200.0).abs() < 1e-6, "{placed:?}");
 }
@@ -3660,10 +3966,13 @@ fn legacy_auto_kern_is_read_on_import() {
 /// back as the same bytes: re-encoded as `FE FF` UTF-16 they make Photoshop refuse the file.
 #[test]
 fn a_style_only_save_keeps_the_raw_strings_of_the_file() {
-    let mut prev = photoshop_txt2(&[(4, 1)]);
-    let version = b"/98 << /0 14 >>";
-    let at = prev.windows(version.len()).position(|w| w == version).expect("the version key");
-    prev.splice(at..at + version.len(), b"/98 << /0 14 /2 (0100) /3 (01110) >>".iter().copied());
+    use crate::engine_data::Value as E;
+    let E::Dict(mut items) = crate::psd::parse_txt2(&photoshop_txt2(&[(4, 1)])).unwrap() else { panic!("a dictionary") };
+    let version = items.iter_mut().find(|(k, _)| k == "98").expect("the version key");
+    let E::Dict(version) = &mut version.1 else { panic!("the version is a dictionary") };
+    version.push(("2".into(), E::RawString("0100".into())));
+    version.push(("3".into(), E::RawString("01110".into())));
+    let prev = crate::engine_data::write_bare(&items);
     // A size the file's runs do not have: the block is rewritten.
     let style = CharStyle { size_pt: 31.0, faux_bold: false, ..Default::default() };
     let out = crate::psd::build_txt2(&[(0, &styled("AVA", style))], Some(&prev));

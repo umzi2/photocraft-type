@@ -973,6 +973,14 @@ fn font_files_of(collection: &mut Collection) -> Vec<std::path::PathBuf> {
     files
 }
 
+/// Extra font folders from `PHOTOCRAFT_FONT_DIRS` (the platform's path-list syntax: `:` on Unix,
+/// `;` on Windows). The app host uses it to add font trees the OS font list cannot see, such as
+/// the Wine Photoshop ones; empty entries are ignored and missing folders are skipped by the scan.
+#[cfg(not(target_arch = "wasm32"))]
+fn env_font_dirs() -> Vec<std::path::PathBuf> {
+    std::env::var_os("PHOTOCRAFT_FONT_DIRS").map_or_else(Vec::new, |dirs| std::env::split_paths(&dirs).filter(|d| !d.as_os_str().is_empty()).collect())
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn system_font_dirs() -> Vec<std::path::PathBuf> {
     use std::path::PathBuf;
@@ -1003,8 +1011,17 @@ pub(crate) fn system_font_dirs() -> Vec<std::path::PathBuf> {
         if let Some(h) = &home {
             v.push(h.join(".local/share/fonts"));
             v.push(h.join(".fonts"));
+            // The Adobe CC fonts Photoshop installed inside PhotoCraft's Wine prefix (`CCMeanwhile`,
+            // `CC Grim N Gritty`, …) are the fonts the PSDs' text layers name (their `TySh` FontSets
+            // hold, for example, `CCMeanwhile` and `CCGrimNGritty-Regular`). They live in the
+            // private prefix, so no OS font folder — and no fontconfig — lists them; without these
+            // two the layers render with fallbacks.
+            let prefix = h.join(".local/share/photocraft/wine/drive_c");
+            v.push(prefix.join("windows/Fonts"));
+            v.push(prefix.join("Program Files/Adobe/Adobe Photoshop CC 2019/Required/PDFL/Resource/Fonts"));
         }
     }
+    v.extend(env_font_dirs());
     v
 }
 
@@ -1170,6 +1187,97 @@ mod tests {
         let listed = super::FontDb::with_system_fonts().families();
         let missing: Vec<&String> = offered.iter().filter(|n| !listed.contains(n)).collect();
         assert!(missing.is_empty(), "macOS offers these families, the font list lacks them: {missing:?}");
+    }
+
+    /// Source files of a family's faces, as the collection knows them.
+    #[cfg(target_os = "linux")]
+    fn family_sources(db: &mut super::FontDb, family: &str) -> Vec<std::path::PathBuf> {
+        use parley::fontique::SourceKind;
+        let Some(info) = db.fcx.collection.family_by_name(family) else {
+            return Vec::new();
+        };
+        info.fonts()
+            .iter()
+            .filter_map(|f| match f.source().kind() {
+                SourceKind::Path(p) => Some(p.to_path_buf()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The file the face carrying `ps` in `family` comes from. `FontDb::faces` lists the faces in
+    /// the same order as the collection's family, so the indexes line up; the exact PostScript
+    /// lookup walks the same order.
+    #[cfg(target_os = "linux")]
+    fn postscript_face_source(db: &mut super::FontDb, family: &str, ps: &str) -> Option<std::path::PathBuf> {
+        use parley::fontique::SourceKind;
+        let index = db.faces(family).iter().position(|f| f.postscript_name.as_deref() == Some(ps))?;
+        let info = db.fcx.collection.family_by_name(family)?;
+        match info.fonts().get(index)?.source().kind() {
+            SourceKind::Path(p) => Some(p.to_path_buf()),
+            _ => None,
+        }
+    }
+
+    /// The text layers of `/media/H/zed2/photocraft/out/psd_showcase/10_all_features.psd` name the
+    /// Adobe CC fonts Photoshop installed in PhotoCraft's Wine prefix: the `TySh` FontSets hold
+    /// `CCMeanwhile`, `CCGrimNGritty-Regular`, `NotoSans-Regular`, `AdobeHeitiStd-Regular` (the
+    /// Japanese layer) and `MyriadPro-Regular`. Those files are outside every OS font folder and
+    /// outside fontconfig, so `system_font_dirs` must add the Wine prefix's two font folders;
+    /// without them the layers render with fallbacks and the caret misses the visible glyphs.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn loads_the_wine_photoshop_fonts_the_psd_layers_name() {
+        let Some(home) = std::env::var_os("HOME") else {
+            eprintln!("skipped: HOME is unset, so PhotoCraft's Wine prefix cannot be located");
+            return;
+        };
+        let prefix = std::path::PathBuf::from(home).join(".local/share/photocraft/wine/drive_c");
+        let wine = prefix.join("windows/Fonts");
+        let pdfl = prefix.join("Program Files/Adobe/Adobe Photoshop CC 2019/Required/PDFL/Resource/Fonts");
+        if !wine.join("CCMeanwhile.otf").is_file() || !pdfl.join("MyriadPro-Regular.otf").is_file() {
+            eprintln!("skipped: {} or {} is missing (PhotoCraft's Wine Photoshop fonts are not installed)", wine.display(), pdfl.display());
+            return;
+        }
+        let mut engine = crate::TextEngine::with_system_fonts();
+        // (family the PSD import's camel-case split of the stored PostScript name produces, the
+        // PostScript name, the prefix folder that face must come from). The CC fonts are CFF OTFs,
+        // so loading their files is not enough: they have to shape and give real advances.
+        let cases = [
+            ("CC Meanwhile", "CCMeanwhile", &wine),
+            ("CC Grim N Gritty", "CCGrimNGritty-Regular", &wine),
+            ("Adobe Heiti Std", "AdobeHeitiStd-Regular", &pdfl),
+            ("Myriad Pro", "MyriadPro-Regular", &pdfl),
+        ];
+        for (family, ps, dir) in cases {
+            assert!(engine.fonts.has_family(family), "'{family}' ({ps}) does not resolve");
+            let resolved = engine.fonts.resolve_postscript(ps);
+            assert_eq!(resolved.family, family, "'{ps}' resolved to {:?} instead of {family:?}", resolved.family);
+            assert!(resolved.exact, "'{ps}' resolved through the heuristic, not the font's own PostScript name");
+            let source = postscript_face_source(&mut engine.fonts, family, ps);
+            assert!(source.as_deref().is_some_and(|p| p.starts_with(dir)), "'{ps}' uses {source:?}, not a face in {}", dir.display());
+        }
+        // Noto Sans is also installed system-wide; the system faces come first in the scan (do not
+        // change the order here). The two NotoSans-Regular.ttf copies are byte-identical, so the
+        // PSD's Noto layers render the same whichever is picked; only require that the prefix's
+        // copy is loaded and the PostScript name resolves.
+        assert!(engine.fonts.has_family("Noto Sans"), "the Wine prefix's Noto Sans is not loaded");
+        let noto = family_sources(&mut engine.fonts, "Noto Sans");
+        assert!(noto.iter().any(|p| p.starts_with(&wine)), "no Noto Sans face from {}: {noto:?}", wine.display());
+        assert!(engine.fonts.resolve_postscript("NotoSans-Regular").exact, "NotoSans-Regular did not resolve exactly");
+        // CFF shaping: "CCMeanwhile Display" (the PSD layer 09) at 30 pt must shape with the real
+        // face, not take the bundled fallback's advances.
+        let layer = photocraft_doc::TextLayer { text: "CCMeanwhile Display".into(), font_family: "CC Meanwhile".into(), size_pt: 30.0, ..Default::default() };
+        let layout = engine.layout(&layer, 72.0);
+        assert!(!layout.glyphs.is_empty(), "CCMeanwhile Display shaped no glyphs");
+        assert!(layout.glyphs.iter().all(|g| g.id != 0), "CCMeanwhile Display shaped .notdef glyphs");
+        let bounds = layout.bounds().expect("the layout has bounds");
+        let width = bounds[2] - bounds[0];
+        let mut fallback = crate::TextEngine::new();
+        let fbounds = fallback.layout(&layer, 72.0).bounds().expect("the fallback layout has bounds");
+        let fwidth = fbounds[2] - fbounds[0];
+        eprintln!("CCMeanwhile Display at 30 pt: Wine face width {width:.2} px, bundled fallback {fwidth:.2} px");
+        assert!((width - fwidth).abs() > 1.0, "the layer took the fallback's advances: {width} vs {fwidth}");
     }
 
     #[test]

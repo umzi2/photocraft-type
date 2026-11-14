@@ -783,8 +783,6 @@ fn import_psd(
     ctl.check().map_err(|_| IoError::Cancelled)?;
     ctl.progress(0.05);
 
-    // Read before the conversion, which moves the global blocks into the document.
-    let txt2 = file.global_blocks.iter().find(|b| &b.key == b"Txt2").and_then(|b| photocraft_text::psd::parse_txt2(&b.data));
     let (mut document, warnings, psd_damaged, fatal_error) = psd_import::psd_to_document_owned(file, ctl, merged).ok_or(IoError::Cancelled)?;
     // Source reads and allocation failures fail the entire open; partial layers are discarded.
     if let Some(e) = fatal_error {
@@ -792,7 +790,7 @@ fn import_psd(
     }
     *damaged = psd_damaged;
     document.name = name.to_string();
-    text_import::prepare(&mut document, txt2.as_ref());
+    text_import::prepare(&mut document);
     Ok(ImportResult { document, warnings, source_read_only: false, preview_only: false })
 }
 

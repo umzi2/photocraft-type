@@ -519,11 +519,40 @@ impl Ex<'_> {
                     self.warnings
                         .push(format!("layer \"{}\": area type is saved as paragraph text over its path's bounds (PSD area type is not written yet)", l.name));
                 }
-                // Text layers without PSD data (created here) get a generated TySh.
-                let generated = t.psd_raw.is_none().then(|| std::sync::Arc::new(photocraft_text::psd::build_tysh(t, self.dpi, None)));
-                let src = t.psd_raw.as_ref().or(generated.as_ref());
+                // Text layers without PSD data (created here) get a generated TySh, and so does a
+                // layer whose preserved block says another text: Photoshop re-renders a type layer
+                // from the model, so a stale `Txt `/EngineData copy would show the old text (or the
+                // old layout) on reopen. The stale block's ink is kept as the measured bounds.
+                // A block whose text the typed reader could not take (a TIFF text layer, say) leaves
+                // the model empty while the block still holds its text: that block is preserved whole,
+                // never rebuilt from the empty model.
+                let parsed_text = t.psd_raw.as_deref().and_then(|d| photocraft_text::psd::tysh_text(d.as_slice()));
+                let unreadable = t.psd_raw.is_some()
+                    && (parsed_text.is_none() || (t.text.is_empty() && parsed_text.is_some_and(|s| !s.is_empty())));
+                let stale = !unreadable && t.psd_raw.as_deref().is_some_and(|d| !photocraft_text::psd::tysh_text_matches(d, t));
+                let generated = (t.psd_raw.is_none() || stale).then(|| {
+                    let ink = t.psd_raw.as_deref().and_then(|d| photocraft_text::psd::tysh_ink(d.as_slice()));
+                    std::sync::Arc::new(photocraft_text::psd::build_tysh(t, self.dpi, ink))
+                });
+                // A preserved block's `Ornt` summary can disagree with the model: an older build
+                // wrote `Hrzn` on vertical text, and an imported file can carry that. Photoshop
+                // refuses such a document ("program error"), and the engine data is what composes,
+                // so rewrite only the summary (the rest of the block stays byte for byte).
+                let oriented = t.psd_raw.as_deref().and_then(|d| {
+                    let want = t.orientation;
+                    (photocraft_text::psd::tysh_orientation(d) != Some(want))
+                        .then(|| photocraft_text::psd::with_tysh_orientation(d, want))
+                        .flatten()
+                        .map(std::sync::Arc::new)
+                });
+                // A stale block is replaced by the rebuilt one; an unchanged preserved block is
+                // still written byte for byte (except the orientation summary above).
+                let src = generated.as_ref().or(oriented.as_ref()).or(t.psd_raw.as_ref());
                 // Character/paragraph style sheets from the document's styles.
-                let styled = src.and_then(|d| crate::text_styles_map::export_tysh(d, t, &self.text_styles, self.dpi)).map(std::sync::Arc::new);
+                let styled = (!unreadable)
+                    .then(|| src.and_then(|d| crate::text_styles_map::export_tysh(d, t, &self.text_styles, self.dpi)))
+                    .flatten()
+                    .map(std::sync::Arc::new);
                 // `TextIndex` names the layer's object in the document's `Txt2` (where the
                 // auto-kern mode lives); left at 0, every type layer would claim object 0 (#1348).
                 // Keep an unchanged preserved TySh byte-for-byte (corpus_tysh_lossless).

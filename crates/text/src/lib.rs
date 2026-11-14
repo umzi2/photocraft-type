@@ -27,12 +27,21 @@ pub mod font_class;
 pub mod fonts;
 pub mod glyphs;
 pub mod layout;
+/// Lays a layer out with the reimplemented Photoshop engine, in the Type tool's
+/// [`layout::TextLayout`] form, so carets and hit testing follow the drawn breaks.
+/// Native only, like [`render_re`].
+#[cfg(not(target_arch = "wasm32"))]
+pub mod layout_re;
 pub mod optical;
 pub mod psd;
 mod psd_path;
 pub mod psd_styles;
 pub mod raster;
 pub mod render;
+/// Renders text layers with the reimplemented Photoshop type engine (`photocraft-text-re`).
+/// Native only: the engine reads its fonts from the filesystem.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod render_re;
 pub mod scripts;
 pub mod served;
 pub mod spell;
@@ -131,6 +140,12 @@ impl TextEngine {
 
     /// Lays out and rasterizes a text layer into document space.
     pub fn render(&mut self, layer: &TextLayer, dpi: f32, format: PixelFormat) -> (TextLayout, Rendered) {
+        // The built-in renderer (parley layout + this crate's rasteriser). The canvas does not
+        // draw through it: `render_re::render_layer` is the pipeline's renderer, and
+        // `photocraft_text::layer_layout` is the caret layout for the layers it draws. This stays
+        // for the layers the engine has no model for (type on a path, non-RGB documents) and for
+        // the callers that need the built-in layout's faces (vector outlines, see
+        // `type_extra_cmds::text_path` and `io::pdf::text`).
         let l = self.layout(layer, dpi);
         let warp = render::layout_deform(&l, layer);
         let r = render::rasterize_warped(&l, &layer.transform, format, layer.antialias, warp.as_ref());
@@ -181,6 +196,24 @@ fn new_shared() -> std::sync::Mutex<TextEngine> {
 /// code that runs every UI frame uses [`try_shared`] instead.
 pub fn shared() -> &'static std::sync::Mutex<TextEngine> {
     SHARED.get_or_init(new_shared)
+}
+
+/// The layout a type layer is drawn with.
+///
+/// The canvas draws type through the reimplemented engine ([`render_re`]) whenever that engine
+/// accepts the layer, and through the built-in renderer otherwise. Caret, hit testing, selection
+/// boxes, geometry conversions and PDF export must measure the *pixels*, so they all ask for this
+/// one layout: the reimplemented engine's ([`layout_re::layout_layer`]) when it draws the layer,
+/// the built-in parley layout otherwise. Two independent layouts are exactly how a caret ends up
+/// on glyphs that were never drawn.
+pub fn layer_layout(t: &TextLayer, dpi: f32, format: PixelFormat) -> TextLayout {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Ok(layout) = layout_re::layout_layer(t, dpi, format) {
+        return layout;
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = format;
+    shared().lock().unwrap_or_else(std::sync::PoisonError::into_inner).layout(t, dpi)
 }
 
 /// [`shared`] without blocking: `None` while the system font scan is still running on its

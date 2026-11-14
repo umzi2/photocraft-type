@@ -117,21 +117,18 @@ pub fn preview(engine: &mut crate::TextEngine, style: &CharStyle, c: char, px: u
     st.strikethrough = false;
     st.tracking = 0.0;
     st.baseline_shift_pt = 0.0;
-    let layer = TextLayer { runs: vec![TextRun { len: text.len(), style: st }], text, ..Default::default() };
+    let mut layer = TextLayer { runs: vec![TextRun { len: text.len(), style: st }], text, ..Default::default() };
+    let fmt = PixelFormat::new(ColorMode::Rgb, SampleType::U8, true);
     let layout = engine.layout(&layer, 72.0);
     let w = layout.bounds().map_or(0.0, |b| b[2] - b[0]);
     let x0 = layout.bounds().map_or(0.0, |b| b[0]);
     let tx = (px as f32 - w) / 2.0 - x0;
-    let fmt = PixelFormat::new(ColorMode::Rgb, SampleType::U8, true);
-    let r = crate::render::rasterize_warped(
-        &layout,
-        &Affine::translate(f64::from(tx), f64::from(px as f32 * 0.78)),
-        fmt,
-        photocraft_doc::text::AntiAlias::Smooth,
-        None,
-    );
+    layer.transform = Affine::translate(f64::from(tx), f64::from(px as f32 * 0.78));
+    let Ok((surface, _)) = crate::render_re::render_layer(&layer, 72.0, fmt) else {
+        return (px, vec![0; (px * px) as usize]);
+    };
     let mut rgba = vec![[0u8; 4]; (px * px) as usize];
-    r.surface.read_rgba8_into(photocraft_geom::Rect::new(0, 0, px as i32, px as i32), &mut rgba);
+    surface.read_rgba8_into(photocraft_geom::Rect::new(0, 0, px as i32, px as i32), &mut rgba);
     (px, rgba.into_iter().map(|p| p[3]).collect())
 }
 

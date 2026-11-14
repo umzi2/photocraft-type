@@ -244,6 +244,10 @@ pub fn style_label(style: &str) -> String {
 /// the Type tool doesn't stall the UI while they are read (#3021). Does nothing on the web.
 pub fn warm_fonts() {
     photocraft_text::warm_shared();
+    // The reimplemented Photoshop engine keeps its own font store for text drawn by the type
+    // commands; scanning it at launch keeps the first Type edit off the store's cold start.
+    #[cfg(not(target_arch = "wasm32"))]
+    photocraft_text::layout_re::warm_async();
 }
 
 /// Whether the font database is ready. The installed fonts are scanned on a background thread

@@ -474,28 +474,157 @@ fn type_sections(app: &mut PhotocraftApp, ui: &mut egui::Ui, character: bool, pa
             }
         });
         ui.add_space(ROW_GAP);
-        row(ui, &mut |ui| {
-            if let Some(v) = num_field(ui, "→|", "Indent left margin", para.start_indent_pt * u, -1296.0 * u..=1296.0 * u, unit, w) {
-                apply(app, ui.ctx(), json!({"startIndent": v / u}));
-            }
-            if let Some(v) = num_field(ui, "|←", "Indent right margin", para.end_indent_pt * u, -1296.0 * u..=1296.0 * u, unit, w) {
-                apply(app, ui.ctx(), json!({"endIndent": v / u}));
-            }
-        });
-        row(ui, &mut |ui| {
-            if let Some(v) = num_field(ui, "¶→", "Indent first line", para.first_line_indent_pt * u, -1296.0 * u..=1296.0 * u, unit, w) {
-                apply(app, ui.ctx(), json!({"firstLineIndent": v / u}));
+        // Photoshop keeps the paragraph panel's groups in a flyout menu; tabs show them at
+        // once: indents and spacing, hyphenation, justification limits, composer and CJK.
+        let mut tab = app.ui.type_panels.paragraph_tab.min(3);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for (i, label) in [tl!("Indents"), tl!("Hyphenation"), tl!("Justify"), tl!("Composer")].into_iter().enumerate() {
+                if ui.selectable_label(tab == i, label).clicked() {
+                    tab = i;
+                }
             }
         });
-        row(ui, &mut |ui| {
-            if let Some(v) = num_field(ui, "↑¶", "Add space before paragraph", para.space_before_pt * u, 0.0 * u..=1296.0 * u, unit, w) {
-                apply(app, ui.ctx(), json!({"spaceBefore": v / u}));
+        app.ui.type_panels.paragraph_tab = tab;
+        ui.add_space(ROW_GAP);
+        match tab {
+            0 => {
+                row(ui, &mut |ui| {
+                    if let Some(v) = num_field(ui, "→|", "Indent left margin", para.start_indent_pt * u, -1296.0 * u..=1296.0 * u, unit, w) {
+                        apply(app, ui.ctx(), json!({"startIndent": v / u}));
+                    }
+                    if let Some(v) = num_field(ui, "|←", "Indent right margin", para.end_indent_pt * u, -1296.0 * u..=1296.0 * u, unit, w) {
+                        apply(app, ui.ctx(), json!({"endIndent": v / u}));
+                    }
+                });
+                row(ui, &mut |ui| {
+                    if let Some(v) = num_field(ui, "¶→", "Indent first line", para.first_line_indent_pt * u, -1296.0 * u..=1296.0 * u, unit, w) {
+                        apply(app, ui.ctx(), json!({"firstLineIndent": v / u}));
+                    }
+                    if let Some(v) = num_field(ui, "↕", "Auto leading (% of the font size)", para.auto_leading * 100.0, 10.0..=500.0, "%", w) {
+                        apply(app, ui.ctx(), json!({"autoLeading": v}));
+                    }
+                });
+                row(ui, &mut |ui| {
+                    if let Some(v) = num_field(ui, "↑¶", "Add space before paragraph", para.space_before_pt * u, 0.0 * u..=1296.0 * u, unit, w) {
+                        apply(app, ui.ctx(), json!({"spaceBefore": v / u}));
+                    }
+                    if let Some(v) = num_field(ui, "¶↓", "Add space after paragraph", para.space_after_pt * u, 0.0 * u..=1296.0 * u, unit, w) {
+                        apply(app, ui.ctx(), json!({"spaceAfter": v / u}));
+                    }
+                });
             }
-            if let Some(v) = num_field(ui, "¶↓", "Add space after paragraph", para.space_after_pt * u, 0.0 * u..=1296.0 * u, unit, w) {
-                apply(app, ui.ctx(), json!({"spaceAfter": v / u}));
+            1 => {
+                let mut on = para.hyphenate;
+                if crate::widgets::checkbox(ui, &mut on, "Hyphenate")
+                    .on_hover_text(tl!("Breaks words at the hyphenation dictionary; the PSD stores it for Photoshop's composer"))
+                    .changed()
+                {
+                    apply(app, ui.ctx(), json!({"hyphenate": on}));
+                }
+                ui.add_space(ROW_GAP);
+                row(ui, &mut |ui| {
+                    if let Some(v) = num_field(ui, "≥", "Words longer than (letters)", f32::from(para.hyphenate_word_size), 1.0..=100.0, "", w) {
+                        apply(app, ui.ctx(), json!({"hyphenateWordsLongerThan": v.round() as u64}));
+                    }
+                    if let Some(v) = num_field(ui, "…", "Hyphen limit (consecutive hyphens)", f32::from(para.hyphen_limit), 0.0..=100.0, "", w) {
+                        apply(app, ui.ctx(), json!({"hyphenLimit": v.round() as u64}));
+                    }
+                });
+                row(ui, &mut |ui| {
+                    if let Some(v) = num_field(ui, "←", "Hyphenate after first (letters)", f32::from(para.hyphenate_min_before), 1.0..=100.0, "", w) {
+                        apply(app, ui.ctx(), json!({"hyphenateAfterFirst": v.round() as u64}));
+                    }
+                    if let Some(v) = num_field(ui, "→", "Hyphenate before last (letters)", f32::from(para.hyphenate_min_after), 1.0..=100.0, "", w) {
+                        apply(app, ui.ctx(), json!({"hyphenateBeforeLast": v.round() as u64}));
+                    }
+                });
+                row(ui, &mut |ui| {
+                    if let Some(v) = num_field(ui, "↔", "Hyphenation zone", para.hyphenation_zone_pt * u, 0.0..=1296.0 * u, unit, w) {
+                        apply(app, ui.ctx(), json!({"hyphenationZone": v / u}));
+                    }
+                });
+                let mut caps = para.hyphenate_capitalized;
+                if crate::widgets::checkbox(ui, &mut caps, "Hyphenate Capitalized Words").changed() {
+                    apply(app, ui.ctx(), json!({"hyphenateCapitalized": caps}));
+                }
             }
-        });
-        // Hyphenate is stored (⌥⇧⌘H / PSD AutoHyphenate) but layout never breaks words (#6710).
+            2 => {
+                let w3 = field_width(full, 3, LABEL_W);
+                row(ui, &mut |ui| {
+                    let mut t = para.justification_word;
+                    let mut changed = false;
+                    for (i, tip) in [(0, "Minimum word spacing (%)"), (1, "Desired word spacing (%)"), (2, "Maximum word spacing (%)")] {
+                        if let Some(v) = num_field(ui, if i == 1 { "W" } else { "" }, tip, t[i] * 100.0, 0.0..=1000.0, "", w3) {
+                            t[i] = v / 100.0;
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        apply(app, ui.ctx(), json!({"wordSpacing": t}));
+                    }
+                });
+                row(ui, &mut |ui| {
+                    let mut t = para.justification_letter;
+                    let mut changed = false;
+                    for (i, tip) in [(0, "Minimum letter spacing (%)"), (1, "Desired letter spacing (%)"), (2, "Maximum letter spacing (%)")] {
+                        if let Some(v) = num_field(ui, if i == 1 { "L" } else { "" }, tip, t[i] * 100.0, -100.0..=1000.0, "", w3) {
+                            t[i] = v / 100.0;
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        apply(app, ui.ctx(), json!({"letterSpacing": t}));
+                    }
+                });
+                row(ui, &mut |ui| {
+                    let mut t = para.justification_glyph;
+                    let mut changed = false;
+                    for (i, tip) in [(0, "Minimum glyph scaling (%)"), (1, "Desired glyph scaling (%)"), (2, "Maximum glyph scaling (%)")] {
+                        if let Some(v) = num_field(ui, if i == 1 { "G" } else { "" }, tip, t[i] * 100.0, 1.0..=1000.0, "", w3) {
+                            t[i] = v / 100.0;
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        apply(app, ui.ctx(), json!({"glyphSpacing": t}));
+                    }
+                });
+            }
+            _ => {
+                let mut every = para.every_line_composer;
+                let opts = [(false, "Adobe Single-line Composer"), (true, "Adobe Every-line Composer")];
+                ui.horizontal(|ui| {
+                    if crate::widgets::dropdown(ui, "props-type-composer", tl!("Composer"), &mut every, &opts, full) {
+                        apply(app, ui.ctx(), json!({"everyLineComposer": every}));
+                    }
+                })
+                .response
+                .on_hover_text(tl!("The PSD stores the composer Photoshop uses; the canvas preview still breaks lines with the single-line composer"));
+                ui.add_space(ROW_GAP);
+                let mut hang = para.hanging_punctuation;
+                if crate::widgets::checkbox(ui, &mut hang, "Hanging Punctuation")
+                    .on_hover_text(tl!(
+                        "Opening punctuation hangs past the left margin here; the PSD header keeps the setting for Photoshop, which also hangs closing punctuation on the right"
+                    ))
+                    .changed()
+                {
+                    apply(app, ui.ctx(), json!({"hangingPunctuation": hang}));
+                }
+                let mut burasagari = para.burasagari;
+                if crate::widgets::checkbox(ui, &mut burasagari, "Burasagari")
+                    .on_hover_text(tl!("Allows CJK punctuation to hang past the right text edge"))
+                    .changed()
+                {
+                    apply(app, ui.ctx(), json!({"burasagari": burasagari}));
+                }
+                let mut order = u64::from(para.kinsoku_order).min(2);
+                let opts = [(0u64, "Push In"), (1, "Push Out First"), (2, "Push Out Only")];
+                if crate::widgets::dropdown(ui, "props-type-kinsoku", tl!("Kinsoku Shori"), &mut order, &opts, full) {
+                    apply(app, ui.ctx(), json!({"kinsokuOrder": order}));
+                }
+            }
+        }
         ui.add_space(ROW_GAP);
     }
 }

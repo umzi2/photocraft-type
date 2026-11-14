@@ -18,7 +18,9 @@ photocraft-cms = { path = "crates/cms" }
 photocraft-raster = { path = "crates/raster" }
 photocraft-doc = { path = "crates/doc" }
 photocraft-ops = { path = "crates/ops" }
-photocraft-psd = { path = "crates/psd" }
+# The authoritative PSD reader/writer lives in the reverse-engineered engine
+# repository; the fork must not carry a second copy that can drift from it.
+photocraft-psd = { path = "../../photocraft/photocraft-psd" }
 photocraft-codecs = { path = "crates/codecs" }
 photocraft-raw = { path = "crates/raw" }
 photocraft-affinity = { path = "crates/affinity" }

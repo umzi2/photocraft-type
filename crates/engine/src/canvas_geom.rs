@@ -117,6 +117,10 @@ pub(crate) fn set_resolution(doc: &mut Document, dpi: f32) {
 /// 5.76 pt at 300 ppi), so `pt x dpi / 72` pixels stay the same and the layer gets no
 /// compensating transform. Box, path and transform are in pixels and stay; tracking and kerning
 /// (1/1000 em) and auto leading (a multiple of the size) follow the size.
+/// `ParagraphStyle`'s default hyphenation zone: a paragraph that never set it must not look like
+/// a local override after a resolution change scales the run but not its style sheet.
+const DEFAULT_HYPHENATION_ZONE: f32 = 36.0;
+
 pub(crate) fn retarget_type_resolution(doc: &mut Document, dpi: f32) {
     // The text engine lays out a resolution that isn't a positive number at 72 ppi.
     let effective = |d: f32| if d.is_finite() && d > 0.0 { f64::from(d) } else { 72.0 };
@@ -139,6 +143,13 @@ pub(crate) fn retarget_type_resolution(doc: &mut Document, dpi: f32) {
             for v in [&mut st.first_line_indent_pt, &mut st.start_indent_pt, &mut st.end_indent_pt, &mut st.space_before_pt, &mut st.space_after_pt] {
                 *v = grown(*v, k);
             }
+            // The hyphenation zone is a point measurement like an indent, but its default is 36
+            // pt rather than zero: scaling a value the paragraph style never overrode would make
+            // the copy differ from the style definition it uses and show a "+" override. Only an
+            // explicitly set zone scales, on both the run and the style attributes below.
+            if (st.hyphenation_zone_pt - DEFAULT_HYPHENATION_ZONE).abs() > f32::EPSILON {
+                st.hyphenation_zone_pt = grown(st.hyphenation_zone_pt, k);
+            }
         }
         retag_text(dpi, t);
     });
@@ -157,6 +168,10 @@ pub(crate) fn retarget_type_resolution(doc: &mut Document, dpi: f32) {
             let scaled = match key.as_str() {
                 "size_pt" | "leading_pt" => point_size(n, k),
                 "baseline_shift_pt" | "first_line_indent_pt" | "start_indent_pt" | "end_indent_pt" | "space_before_pt" | "space_after_pt" => grown(n, k),
+                // Matches the run rule above: a style that does not override the 36 pt default
+                // keeps it, so a copy that uses the style has no false local override.
+                "hyphenation_zone_pt" if (n - DEFAULT_HYPHENATION_ZONE).abs() > f32::EPSILON => grown(n, k),
+                "hyphenation_zone_pt" => continue,
                 _ => continue,
             };
             *v = serde_json::json!(scaled);

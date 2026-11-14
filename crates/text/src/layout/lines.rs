@@ -237,6 +237,53 @@ fn justify_line(out: &mut TextLayout, c0: usize, g0: usize, slack: f32) -> f32 {
     slack
 }
 
+/// Measured hanging-punctuation tables of Photoshop 20.0.2 (the reverse-engineering
+/// workspace's `docs/hanging-punctuation.md`, probes `chars.pdf` and `hang3..6.pdf`): the value
+/// is the fraction of the glyph's advance that stays in the line flow when it starts a line;
+/// `0.0` means it hangs entirely in the margin. `(`, `[`, `{`, `!`, `?` and `•` do not hang.
+const LEFT_HANG: &[(char, f32)] = &[
+    ('\u{201C}', 0.0), // “
+    ('\u{201D}', 0.0), // ”
+    ('\u{2018}', 0.0), // ‘
+    ('\u{2019}', 0.0), // ’
+    ('\u{00AB}', 0.0), // «
+    ('\u{00BB}', 0.0), // »
+    ('"', 0.0),
+    ('\'', 0.0),
+    ('-', 0.0),
+    (',', 0.0),
+    ('.', 0.0),
+    (';', 0.5),
+    (':', 0.5),
+    ('*', 0.5),
+    ('\u{2026}', 0.5), // …
+    ('\u{2013}', 0.5), // –
+    ('\u{2014}', 0.5), // —
+];
+
+/// CJK left-hang set (`Burasagari`): inferred from JIS X 4051 with the half-em the fallback
+/// measurements show; a native CJK Photoshop probe showed no hanging at all
+/// (`docs/STATUS.md`), so this follows the workspace's documented model, not a measurement.
+const CJK_LEFT_HANG: &[(char, f32)] = &[
+    ('\u{300C}', 0.5), // 「
+    ('\u{300E}', 0.5), // 『
+    ('\u{FF08}', 0.5), // （
+    ('\u{3010}', 0.5), // 【
+    ('\u{3008}', 0.5), // 〈
+    ('\u{300A}', 0.5), // 《
+    ('\u{3014}', 0.5), // 〔
+    ('\u{FF3B}', 0.5), // ［
+    ('\u{FF5B}', 0.5), // ｛
+    ('\u{201C}', 0.5), // “
+    ('\u{2018}', 0.5), // ‘
+];
+
+/// Flow share of `ch` when it starts a line under the paragraph's hanging options.
+fn left_hang_fit(ch: char, hanging: bool, burasagari: bool) -> Option<f32> {
+    let roman = hanging.then(|| LEFT_HANG.iter().find(|(c, _)| *c == ch).map(|(_, f)| *f)).flatten();
+    roman.or_else(|| burasagari.then(|| CJK_LEFT_HANG.iter().find(|(c, _)| *c == ch).map(|(_, f)| *f)).flatten())
+}
+
 /// Line space → text space (90° clockwise); upright glyphs centred on the column.
 fn rotate_to_text_space(glyphs: &mut [PlacedGlyph], vinfo: &[VGlyph], baseline: f32) {
     for (g, v) in glyphs.iter_mut().zip(vinfo) {
@@ -433,11 +480,49 @@ impl Para<'_> {
             let slack = self.line_avail(f).unwrap_or(0.0) - (adv + state.extra);
             state.extra += justify_line(out, c0, g0, slack);
         }
+        // Hanging punctuation (`Hanging`, `Txt2` `/5/21`; Burasagari): the glyphs that start
+        // the line move left by the part of their advance that hangs, while the rest of the line
+        // keeps the margin the fit test used. A line made only of hanging glyphs keeps its
+        // normal start (Photoshop leaves it flush).
+        let mut hang_shift = 0.0f32;
+        // Only a line that starts at the left text edge can hang a prefix into the left margin:
+        // Photoshop places the opening punctuation before that edge (measured, see
+        // `docs/hanging-punctuation.md`). A centred or right-aligned line's start is inside the
+        // box, so its prefix must stay put. Its closing punctuation could hang on the right, but
+        // that side is not implemented yet, so those lines keep today's layout.
+        let at_left_edge = m.offset.abs() <= 0.01;
+        if at_left_edge && !env.vertical && (self.ps.hanging_punctuation || self.ps.burasagari) {
+            let mut overhangs: Vec<(f32, f32, f32)> = Vec::new();
+            let count = out.clusters.len().saturating_sub(c0);
+            for cl in &out.clusters[c0..] {
+                if overhangs.len() + 1 >= count || cl.rtl {
+                    break;
+                }
+                let Some(ch) = env.text.get(cl.range.start..).and_then(|s| s.chars().next()) else { break };
+                let Some(fit) = left_hang_fit(ch, self.ps.hanging_punctuation, self.ps.burasagari) else { break };
+                let overhang = cl.advance * (1.0 - fit);
+                if overhang <= 0.0 {
+                    break;
+                }
+                overhangs.push((cl.x, cl.advance, overhang));
+            }
+            if !overhangs.is_empty() {
+                for (cl, (_, _, overhang)) in out.clusters[c0..].iter_mut().zip(&overhangs) {
+                    cl.x -= overhang;
+                }
+                for glyph in &mut out.glyphs[g0..] {
+                    if let Some((_, _, overhang)) = overhangs.iter().find(|(x, advance, _)| glyph.x >= *x - 0.05 && glyph.x < *x + *advance - 0.05) {
+                        glyph.x -= overhang;
+                    }
+                }
+                hang_shift = overhangs.iter().map(|(_, _, o)| *o).sum();
+            }
+        }
         if env.vertical {
             rotate_to_text_space(&mut out.glyphs[g0..], &state.vinfo, f.baseline);
         }
         let lr = line.text_range();
-        let x0 = dx + m.offset;
+        let x0 = dx + m.offset - hang_shift;
         out.lines.push(LineInfo {
             range: self.map_offset(lr.start)..self.map_offset(lr.end).min(self.content_end),
             baseline: f.baseline,

@@ -128,6 +128,20 @@ fn perturbed_para() -> ParagraphStyle {
         auto_leading: -1.0,
         direction: TextDirection::Rtl,
         hyphenate: true,
+        // Distinct from every default so `touched` sees a panel key that sets them.
+        hanging_punctuation: true,
+        every_line_composer: true,
+        burasagari: true,
+        kinsoku_order: 1,
+        hyphenate_word_size: 3,
+        hyphenate_min_before: 1,
+        hyphenate_min_after: 1,
+        hyphen_limit: 1,
+        hyphenation_zone_pt: -1.0,
+        hyphenate_capitalized: false,
+        justification_word: [0.5, 0.6, 0.7],
+        justification_letter: [0.1, 0.2, 0.3],
+        justification_glyph: [0.8, 0.9, 1.1],
         style_sheet: None,
     }
 }

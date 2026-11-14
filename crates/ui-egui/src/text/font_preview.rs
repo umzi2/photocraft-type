@@ -84,20 +84,22 @@ fn render(engine: &mut photocraft_text::TextEngine, family: &str, text: &str, sl
     if text.is_empty() {
         return None;
     }
-    let layer = TextLayer { text: text.into(), font_family: family.into(), size_pt: size * scale as f32, ..Default::default() };
-    let layout = engine.layout(&layer, 72.0);
-    let bounds = layout.bounds()?;
+    let mut layer = TextLayer { text: text.into(), font_family: family.into(), size_pt: size * scale as f32, ..Default::default() };
     let width = (slot as u32 * scale) as usize;
     let height = (scaled(HEIGHT, size) as u32 * scale) as usize;
-    let transform = Affine::translate(f64::from(-bounds[0]), f64::from((height as f32 - (bounds[3] - bounds[1])) / 2.0 - bounds[1]));
-    // Reject oversized ink before the rasterizer allocates a surface (malformed installed fonts).
-    let ink = photocraft_text::render::ink_rect(&layout, &transform);
-    if ink.is_empty() || ink.width() > width as u32 * 4 || ink.height() > height as u32 * 4 {
+    let format = PixelFormat::new(ColorMode::Rgb, SampleType::U8, true);
+    let layout = photocraft_text::layer_layout(&layer, 72.0, format);
+    let bounds = layout.bounds()?;
+    layer.transform = Affine::translate(f64::from(-bounds[0]), f64::from((height as f32 - (bounds[3] - bounds[1])) / 2.0 - bounds[1]));
+    // The preview raster goes through the same renderer the canvas uses.
+    let (rendered, _) = photocraft_text::render_re::render_layer(&layer, 72.0, format).ok()?;
+    // Reject oversized ink before building the sample row (malformed installed fonts).
+    let covered = rendered.content_bounds();
+    if covered.is_empty() || covered.width() > width as u32 * 4 || covered.height() > height as u32 * 4 {
         return None;
     }
-    let rendered = photocraft_text::render::rasterize(&layout, &transform, PixelFormat::new(ColorMode::Rgb, SampleType::U8, true), layer.antialias);
     let mut rgba = vec![[0u8; 4]; width * height];
-    rendered.surface.read_rgba8_into(photocraft_geom::Rect::new(0, 0, width as i32, height as i32), &mut rgba);
+    rendered.read_rgba8_into(photocraft_geom::Rect::new(0, 0, width as i32, height as i32), &mut rgba);
     Some(ColorImage::from_rgba_unmultiplied([width, height], &rgba.into_iter().flat_map(|p| [255, 255, 255, p[3]]).collect::<Vec<_>>()))
 }
 

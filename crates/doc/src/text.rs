@@ -198,6 +198,39 @@ pub struct ParagraphStyle {
     pub auto_leading: f32,
     pub direction: TextDirection,
     pub hyphenate: bool,
+    /// Photoshop's Paragraph panel › Hanging Punctuation (`Hanging` in `EngineData`, `Txt2`
+    /// paragraph sheet `/5/21`): opening punctuation may hang past the left text edge and
+    /// closing punctuation past the right one.
+    pub hanging_punctuation: bool,
+    /// Adobe Every-line Composer (`EveryLineComposer` in `EngineData`, `Txt2` `/5/29`) instead
+    /// of the single-line (first-fit) composer.
+    pub every_line_composer: bool,
+    /// CJK burasagari (`Burasagari` in `EngineData`; no measured `Txt2` slot).
+    pub burasagari: bool,
+    /// Photoshop's Kinsoku Shori order (`KinsokuOrder` in `EngineData`): 0 push in, 1 push out
+    /// first, 2 push out only. No measured `Txt2` slot.
+    pub kinsoku_order: u8,
+    /// Hyphenation › Words Longer Than, in letters (Photoshop UI; `HyphenatedWordSize` in
+    /// `EngineData`, `Txt2` `/5/10` stores it as the UI value + 1).
+    pub hyphenate_word_size: u8,
+    /// Hyphenation › After First, in letters (`PreHyphen`, `Txt2` `/5/11`).
+    pub hyphenate_min_before: u8,
+    /// Hyphenation › Before Last, in letters (`PostHyphen`, `Txt2` `/5/12`).
+    pub hyphenate_min_after: u8,
+    /// Hyphenation › Hyphen Limit (`ConsecutiveHyphens`, `Txt2` `/5/13`).
+    pub hyphen_limit: u8,
+    /// Hyphenation › Hyphenation Zone in points (`Zone`, `Txt2` `/5/14`).
+    pub hyphenation_zone_pt: f32,
+    /// Hyphenation › Hyphenate Capitalized Words (`Txt2` `/5/15`; no `EngineData` key).
+    pub hyphenate_capitalized: bool,
+    /// Justification limits as `[minimum, desired, maximum]` fractions of the normal word space
+    /// (`WordSpacing` in `EngineData`, `Txt2` `/5/17`).
+    pub justification_word: [f32; 3],
+    /// Justification limits for inter-letter spacing, in em fractions (`LetterSpacing`,
+    /// `Txt2` `/5/18`).
+    pub justification_letter: [f32; 3],
+    /// Justification limits for glyph scaling, as fractions (`GlyphSpacing`, `Txt2` `/5/19`).
+    pub justification_glyph: [f32; 3],
     /// Applied paragraph style (id in [`crate::TextStyles`]); `None` = Basic Paragraph.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub style_sheet: Option<u32>,
@@ -215,6 +248,22 @@ impl Default for ParagraphStyle {
             auto_leading: 1.2,
             direction: TextDirection::Auto,
             hyphenate: false,
+            // Photoshop's defaults: both composers off (single-line), hanging punctuation off,
+            // burasagari off, kinsoku push-in. The hyphenation numbers are Photoshop's paragraph
+            // defaults (`Txt2` run sheet `/5/10`…`/15`; the UI shows `/10 - 1` letters).
+            hanging_punctuation: false,
+            every_line_composer: false,
+            burasagari: false,
+            kinsoku_order: 0,
+            hyphenate_word_size: 6,
+            hyphenate_min_before: 2,
+            hyphenate_min_after: 2,
+            hyphen_limit: 0,
+            hyphenation_zone_pt: 36.0,
+            hyphenate_capitalized: true,
+            justification_word: [0.8, 1.0, 1.33],
+            justification_letter: [0.0, 0.0, 0.0],
+            justification_glyph: [1.0, 1.0, 1.0],
             style_sheet: None,
         }
     }

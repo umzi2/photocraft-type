@@ -202,10 +202,25 @@ pub(super) fn first_ascent(line: &parley::Line<'_, RunBrush>) -> Option<f32> {
         let coords: Vec<skrifa::instance::NormalizedCoord> = run.normalized_coords().iter().map(|&c| skrifa::instance::NormalizedCoord::from_bits(c)).collect();
         let loc = skrifa::instance::LocationRef::new(&coords);
         let size = skrifa::instance::Size::new(run.font_size());
-        let h = font.charmap().map('d').and_then(|g| font.glyph_metrics(size, loc).bounds(g)).map(|b| b.y_max).or_else(|| {
-            let m = font.metrics(size, loc);
-            m.cap_height.or(Some(m.ascent * 0.75))
-        });
+        // Photoshop's "first baseline: ascent" is measured to the top of the
+        // cap, i.e. the ink yMax of `H`, not the ascender glyph `d`: on Times
+        // New Roman (`d` 1422 vs `H` 1356 of 2048 units) the `d` rule drew the
+        // whole box layer 1-2 px low (the user's "text is 2 px lower than
+        // Photoshop"; measured against Photoshop at 12-400 pt on 2026-11-14).
+        let ink = |ch: char| font.charmap().map(ch).and_then(|g| font.glyph_metrics(size, loc).bounds(g)).map(|b| b.y_max);
+        // The smaller of the `H` cap and the `d` ascender ink, the rule the
+        // library's `Face::ascent_ratio` implements (measured against Photoshop;
+        // see out/verify/text-baseline-offset.md). The other cap letters are a
+        // fallback for faces without both reference glyphs.
+        let reference: Vec<f32> = ['H', 'd'].into_iter().filter_map(ink).collect();
+        let h = if reference.is_empty() {
+            ['E', 'I', 'T', 'b', 'l'].into_iter().find_map(ink).or_else(|| {
+                let m = font.metrics(size, loc);
+                m.cap_height.or(Some(m.ascent * 0.75))
+            })
+        } else {
+            Some(reference.into_iter().fold(f32::INFINITY, f32::min))
+        };
         if let Some(h) = h {
             best = Some(best.map_or(h, |b: f32| b.max(h)));
         }

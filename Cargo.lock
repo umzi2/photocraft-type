@@ -5556,7 +5556,7 @@ dependencies = [
  "photocraft-raster",
  "photocraft-raw",
  "photocraft-testkit",
- "photocraft-text",
+ "photocraft-text 0.23.0",
  "photocraft-vector",
  "rayon",
  "roxmltree 0.21.1",
@@ -5650,7 +5650,7 @@ dependencies = [
  "photocraft-raster",
  "photocraft-raw",
  "photocraft-testkit",
- "photocraft-text",
+ "photocraft-text 0.23.0",
  "photocraft-vector",
  "proptest",
  "resvg",
@@ -5706,13 +5706,10 @@ dependencies = [
 
 [[package]]
 name = "photocraft-psd"
-version = "0.23.0"
+version = "0.20.1"
 dependencies = [
  "encoding_rs",
  "flate2",
- "photocraft-psd",
- "proptest",
- "serde",
  "thiserror 2.0.21",
 ]
 
@@ -5772,6 +5769,16 @@ dependencies = [
 
 [[package]]
 name = "photocraft-text"
+version = "0.1.0"
+dependencies = [
+ "photocraft-psd",
+ "serde",
+ "thiserror 2.0.21",
+ "unicode-segmentation",
+]
+
+[[package]]
+name = "photocraft-text"
 version = "0.23.0"
 dependencies = [
  "flate2",
@@ -5781,6 +5788,7 @@ dependencies = [
  "photocraft-geom",
  "photocraft-psd",
  "photocraft-raster",
+ "photocraft-text 0.1.0",
  "rayon",
  "skrifa 0.47.0",
 ]
@@ -5821,7 +5829,7 @@ dependencies = [
  "photocraft-raster",
  "photocraft-raw",
  "photocraft-testkit",
- "photocraft-text",
+ "photocraft-text 0.23.0",
  "photocraft-vector",
  "rayon",
  "serde",

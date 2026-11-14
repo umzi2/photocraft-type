@@ -1052,3 +1052,75 @@ fn apply_box_clamps_sizes_to_a_finite_minimum_and_maximum() {
     apply_box(&mut t, [0.0, 0.0, -20.0, 0.25]);
     assert_eq!(box_size(&t), (1.0, 1.0));
 }
+
+/// The paragraph-panel depth of `type.setStyle`: hyphenation numbers, hanging punctuation, the
+/// composer, CJK options and the justification spacing limits.
+#[test]
+fn paragraph_depth_keys_apply_to_the_model() {
+    use photocraft_doc::text::ParagraphStyle;
+    let mut p = ParagraphStyle::default();
+    assert!(apply_para_props(
+        &mut p,
+        &json!({
+            "hangingPunctuation": true,
+            "composer": "everyLine",
+            "burasagari": true,
+            "kinsokuOrder": 2,
+            "hyphenate": true,
+            "hyphenateWordsLongerThan": 8,
+            "hyphenateAfterFirst": 3,
+            "hyphenateBeforeLast": 4,
+            "hyphenLimit": 2,
+            "hyphenationZone": 18.0,
+            "hyphenateCapitalized": false,
+            "wordSpacing": [0.7, 0.9, 1.2],
+            "letterSpacing": [-0.1, 0.0, 0.1],
+            "glyphSpacing": [0.95, 1.0, 1.05],
+        })
+    ));
+    assert!(p.hanging_punctuation && p.every_line_composer && p.burasagari);
+    assert_eq!(p.kinsoku_order, 2);
+    assert!(p.hyphenate);
+    assert_eq!((p.hyphenate_word_size, p.hyphenate_min_before, p.hyphenate_min_after, p.hyphen_limit), (8, 3, 4, 2));
+    assert!((p.hyphenation_zone_pt - 18.0).abs() < 1e-6);
+    assert!(!p.hyphenate_capitalized);
+    assert_eq!(p.justification_word, [0.7, 0.9, 1.2]);
+    assert_eq!(p.justification_letter, [-0.1, 0.0, 0.1]);
+    assert_eq!(p.justification_glyph, [0.95, 1.0, 1.05]);
+    // Values are clamped and ordered the way Photoshop's dialog keeps them; the `everyLine`
+    // composer is the explicit spelling of `everyLineComposer`.
+    let mut q = ParagraphStyle::default();
+    assert!(apply_para_props(&mut q, &json!({"everyLineComposer": true, "wordSpacing": [2.0, 0.5, 0.1], "hyphenationZone": -5.0})));
+    assert!(q.every_line_composer);
+    assert_eq!(q.justification_word, [0.5, 0.5, 0.5], "minimum <= desired <= maximum");
+    assert_eq!(q.hyphenation_zone_pt, 0.0, "a negative zone is no zone");
+    assert!(!apply_para_props(&mut q, &json!({"nonsenseKey": 1})), "unknown keys change nothing");
+}
+
+/// A `type.setStyle` paragraph edit lands in the paragraph runs (and so in PSD export): the
+/// style of the paragraph that holds the range, and only that paragraph.
+#[test]
+fn set_style_paragraph_depth_lands_in_the_paragraph_runs() {
+    let mut s = session();
+    let id = s.execute("type.create", json!({"x": 0, "y": 40, "text": "First\nSecond", "size": 12})).unwrap()["layer"].as_u64().unwrap();
+    s.execute(
+        "type.setStyle",
+        json!({
+            "layer": id,
+            "range": [6, 12],
+            "hangingPunctuation": true,
+            "everyLineComposer": true,
+            "hyphenate": true,
+            "hyphenateWordsLongerThan": 9,
+            "hyphenationZone": 12.0,
+            "wordSpacing": [0.9, 1.0, 1.1],
+        }),
+    )
+    .unwrap();
+    let styles: Vec<ParagraphStyle> = text_layer(&s, id).paragraph_runs().into_iter().map(|r| r.style).collect();
+    assert_eq!(styles.len(), 2);
+    assert!(styles[1].hanging_punctuation && styles[1].every_line_composer && styles[1].hyphenate);
+    assert_eq!(styles[1].hyphenate_word_size, 9);
+    assert_eq!(styles[1].justification_word, [0.9, 1.0, 1.1]);
+    assert!(!styles[0].hanging_punctuation, "the first paragraph keeps its style");
+}

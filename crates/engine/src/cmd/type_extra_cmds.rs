@@ -7,6 +7,7 @@
 //! so the PSD `TySh` data (and with it warp, anti-aliasing and the OpenType flags) is regenerated
 //! and the layer saves as editable text.
 
+use photocraft_color::PixelFormat;
 use photocraft_doc::text::{AntiAlias, FontFeature, Orientation, TextAlign, TextShape, TextWarp};
 use photocraft_doc::vector::{Knot, Path, PathOp, Subpath};
 use photocraft_doc::{Affine, Document, Fill, Layer, LayerContent, LayerId, ShapeLayer, TextLayer};
@@ -97,11 +98,13 @@ pub(crate) fn with_text<R>(s: &mut Session, p: &Value, label: &str, f: impl FnOn
 }
 
 fn layout(doc: &Document, t: &TextLayer) -> photocraft_text::TextLayout {
-    layout_at(doc.resolution_dpi, t)
+    photocraft_text::layer_layout(t, doc.resolution_dpi, doc.pixel_format())
 }
 
-fn layout_at(dpi: f32, t: &TextLayer) -> photocraft_text::TextLayout {
-    photocraft_text::shared().lock().unwrap_or_else(|e| e.into_inner()).layout(t, dpi)
+/// The layout the layer is *drawn* with (`layer_layout` picks the engine's layout whenever the
+/// engine rasterises the layer, so the caret and the pixels cannot come from different layouts).
+fn layout_at(dpi: f32, format: PixelFormat, t: &TextLayer) -> photocraft_text::TextLayout {
+    photocraft_text::layer_layout(t, dpi, format)
 }
 
 /// `m ∘ translate(tx, ty)`.
@@ -155,8 +158,9 @@ fn set_orientation(s: &mut Session, p: &Value, o: Orientation) -> Result<Value> 
 // ---------- point ⇄ paragraph ----------
 
 fn to_paragraph(s: &mut Session, p: &Value) -> Result<Value> {
+    let format = s.active().ok_or(EngineError::NoDocument)?.doc.pixel_format();
     let r = with_text(s, p, "Convert to Paragraph Text", |t, dpi| {
-        let l = layout_at(dpi, t);
+        let l = layout_at(dpi, format, t);
         let size_px = t.char_runs().iter().map(|r| r.style.size_pt).fold(t.size_pt, f32::max) * dpi / 72.0;
         let ps = t.paragraph_runs().first().map(|p| p.style.clone()).unwrap_or_default();
         let indents = (ps.start_indent_pt + ps.end_indent_pt).max(0.0) * dpi / 72.0;
@@ -170,11 +174,23 @@ fn to_paragraph(s: &mut Session, p: &Value) -> Result<Value> {
                 TextAlign::Right | TextAlign::JustifyRight => -height,
                 _ => 0.0,
             };
-            // The box's right edge is the first column's right edge, so the columns stay put.
-            let x = -v0 - width;
+            // The engine's vertical box puts the first column's baseline where its own layout
+            // says, which is not exactly parley's convention. Rather than hard-coding another
+            // closed form, lay the box out and move it so the first column starts exactly where
+            // the point layout had it.
+            let probe = TextLayer { shape: TextShape::Box { x: 0.0, y: 0.0, width, height }, ..t.clone() };
+            let boxed = layout_at(dpi, format, &probe);
+            let (x, y) = match (l.glyphs.first(), boxed.glyphs.first(), l.bounds(), boxed.bounds()) {
+                (Some(a), Some(b), _, _) => {
+                    let (here, there) = (l.to_text(a.x, a.y), boxed.to_text(b.x, b.y));
+                    (f64::from(here.0 - there.0), f64::from(here.1 - there.1))
+                }
+                (_, _, Some(here), Some(there)) => (f64::from(here[0] - there[0]), f64::from(y) + f64::from(here[1] - there[1])),
+                _ => (f64::from(-v0 - width), f64::from(y)),
+            };
             t.shape = TextShape::Box { x: 0.0, y: 0.0, width, height };
-            t.transform = then_translate(&t.transform, f64::from(x), f64::from(y));
-            return Ok(json!([x, y, width, height]));
+            t.transform = then_translate(&t.transform, x, y);
+            return Ok(json!([x as f32, y as f32, width, height]));
         }
         let [x0, y0, x1, y1] = l.bounds().unwrap_or([0.0, -t.size_pt, t.size_pt, 0.0]);
         // A little slack so no line re-wraps; the box keeps the text where it was.
@@ -189,7 +205,7 @@ fn to_paragraph(s: &mut Session, p: &Value) -> Result<Value> {
         probe.shape = TextShape::Box { x, y: y0, width, height };
         // Box text puts the first baseline at the box top plus the ascender height: measure it and
         // shift the box so that baseline stays at the point-text anchor (y = 0).
-        let b0 = layout_at(dpi, &probe).lines.first().map_or(0.0, |ln| ln.baseline);
+        let b0 = layout_at(dpi, format, &probe).lines.first().map_or(0.0, |ln| ln.baseline);
         let y = y0 - b0;
         t.shape = TextShape::Box { x: 0.0, y: 0.0, width, height };
         t.transform = then_translate(&t.transform, f64::from(x), f64::from(y));
@@ -199,9 +215,10 @@ fn to_paragraph(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn to_point(s: &mut Session, p: &Value) -> Result<Value> {
+    let format = s.active().ok_or(EngineError::NoDocument)?.doc.pixel_format();
     let r = with_text(s, p, "Convert to Point Text", |t, dpi| {
         let TextShape::Box { x, y, width, height } = t.shape else { return Err(EngineError::Other("already point text".into())) };
-        let l = layout_at(dpi, t);
+        let l = layout_at(dpi, format, t);
         // Vertical type: columns run along the box height.
         let (x, width) = if l.vertical { (y, height) } else { (x, width) };
         let baseline = l.lines.first().map_or(0.0, |ln| ln.baseline);
@@ -219,8 +236,20 @@ fn to_point(s: &mut Session, p: &Value) -> Result<Value> {
             _ => x,
         };
         t.shape = TextShape::Point;
-        // `baseline` is in line space (it already includes the box edge).
-        let (tx, ty) = l.to_text(ax, baseline);
+        // `baseline` is in line space (it already includes the box edge). Vertical type: the
+        // engine's own point layout is measured and the layer moved so the first column stays
+        // exactly where the box had it (the two shapes place the column differently).
+        let (tx, ty) = if l.vertical {
+            let here = l.glyphs.first().map(|g| l.to_text(g.x, g.y));
+            let point_layout = layout_at(dpi, format, t);
+            let there = point_layout.glyphs.first().map(|g| point_layout.to_text(g.x, g.y));
+            match (here, there) {
+                (Some(here), Some(there)) => (here.0 - there.0, here.1 - there.1),
+                _ => l.to_text(ax, baseline),
+            }
+        } else {
+            l.to_text(ax, baseline)
+        };
         t.transform = then_translate(&t.transform, f64::from(tx), f64::from(ty));
         Ok(breaks.len())
     })?;
@@ -291,7 +320,11 @@ fn contours(els: &[PathEl]) -> Vec<Vec<Knot>> {
 /// like its largest contour combine and the others (counters such as the hole in "o") subtract,
 /// which reproduces the nonzero fill under Photoshop's per-subpath path operations.
 pub fn text_path(doc: &Document, t: &TextLayer) -> Path {
-    let l = layout(doc, t);
+    // The glyph *outlines* are drawn from the layout's `faces`, which the engine's layout
+    // adapter does not fill yet (it sets every glyph's face to the primary one), so the vector
+    // path still takes its layout from the built-in parley engine. This is the outline path only:
+    // the layer's pixels and caret use `photocraft_text::layer_layout`.
+    let l = photocraft_text::shared().lock().unwrap_or_else(|e| e.into_inner()).layout(t, doc.resolution_dpi);
     let warp = photocraft_text::render::layout_deform(&l, t);
     let mut subpaths = Vec::new();
     for glyph in photocraft_text::render::outlines(&l, &t.transform, warp.as_ref()) {

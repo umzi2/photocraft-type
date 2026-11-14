@@ -1,0 +1,40 @@
+font AdobeHeitiStd-Regular
+size 22.0
+aa 1
+bold 0
+italic 0
+hscale 1.0
+pen_x 40.0
+baseline_y 120.0
+phase 0.0
+bin atlas.bin
+glyph 3001 0 -5 7 6 0 \u3001
+glyph 3002 1 -5 6 7 42 \u3002
+glyph 300C 14 -19 8 16 84 \u300c
+glyph 300D 1 -14 7 16 212 \u300d
+glyph 3044 1 -16 20 17 324 \u3044
+glyph 304B 1 -18 21 20 664 \u304b
+glyph 3053 3 -17 16 18 1084 \u3053
+glyph 3057 5 -18 16 19 1372 \u3057
+glyph 3059 1 -19 20 21 1676 \u3059
+glyph 305F 2 -19 19 21 2096 \u305f
+glyph 3060 2 -19 20 21 2495 \u3060
+glyph 3063 3 -12 16 13 2915 \u3063
+glyph 3067 1 -17 21 19 3123 \u3067
+glyph 306A 1 -19 19 21 3522 \u306a
+glyph 306F 2 -18 19 19 3921 \u306f
+glyph 307E 2 -19 18 21 4282 \u307e
+glyph 3089 3 -19 16 21 4660 \u3089
+glyph 308C 0 -18 22 20 4996 \u308c
+glyph 308F 1 -18 20 20 5436 \u308f
+glyph 30B9 1 -17 20 18 5836 \u30b9
+glyph 30C6 2 -17 18 19 6196 \u30c6
+glyph 30C8 7 -18 12 19 6538 \u30c8
+glyph 53E5 1 -19 19 21 6766 \u53e5
+glyph 5F27 1 -18 21 20 7165 \u5f27
+glyph 5F7C 1 -19 20 21 7585 \u5f7c
+glyph 62EC 1 -19 20 21 8005 \u62ec
+glyph 70B9 1 -19 20 21 8425 \u70b9
+glyph 7D42 1 -19 21 21 8845 \u7d42
+glyph 8A00 1 -19 20 20 9286 \u8a00
+glyph 8AAD 1 -19 21 21 9686 \u8aad

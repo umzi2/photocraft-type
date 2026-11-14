@@ -60,8 +60,9 @@ pub(crate) struct Ctx<'a> {
     pub fatal_error: Option<crate::IoError>,
     /// Document resolution (type sizes are converted to points with it).
     pub dpi: f32,
-    /// The parsed `Txt2` block (type settings EngineData lacks, e.g. optical kerning).
-    pub txt2: Option<photocraft_text::engine_data::Value>,
+    /// The document's raw `Txt2` block (type settings EngineData lacks, e.g.
+    /// optical kerning; the engine reads it with the layer's `TySh`).
+    pub txt2: Option<Vec<u8>>,
     /// Smart-filter caches from the global `FEid`/`FXid` blocks (filter masks, by placed id).
     pub filter_effects: Vec<photocraft_psd::filter_effects::FilterEffectsItem>,
     /// Filter masks already decoded, by placed id: every layer of a source reads the same item, and
@@ -552,26 +553,27 @@ impl Ctx<'_> {
             // foreign-order block must never be handed to the big-endian reader (#4758). Canonical
             // data the typed reader can't decode stays a type layer as before (usually without
             // text), so its TySh is saved back verbatim instead of being dropped with the raster.
+            // The engine reads the `TySh` (and, when the document has one, the `Txt2` block)
+            // itself: styles, paragraph runs, the frame and type on a path all come from
+            // `psd::read_layer`, so no `apply_txt2*` step follows.
             let parsed = (!block.is_foreign_order())
                 .then(|| {
-                    photocraft_text::psd::text_layer_from_tysh(&block.data, self.dpi).or_else(|| {
+                    // A block Photoshop would refuse (an older save of ours: no `/0 /5`, `/0 /6`
+                    // or `/1 /0` scaffolding) must not be read back either: its objects are the
+                    // stale text of the save that wrote them, and the `TySh` engine data has the
+                    // layer's real text, styles and shape.
+                    match self.txt2.as_deref().filter(|t| photocraft_text::psd::txt2_is_valid(t)) {
+                        Some(txt2) => photocraft_text::psd::text_layer_from_tysh_with_txt2(&block.data, txt2, self.dpi)
+                            .or_else(|| photocraft_text::psd::text_layer_from_tysh(&block.data, self.dpi)),
+                        None => photocraft_text::psd::text_layer_from_tysh(&block.data, self.dpi),
+                    }
+                    .or_else(|| {
                         let (text, transform) = blocks::parse_tysh(&block.data)?;
                         photocraft_text::psd::transform_is_safe(&transform).then(|| TextLayer { text, transform, ..Default::default() })
                     })
                 })
                 .flatten();
             if let Some(mut t) = parsed {
-                let mut path_error = None;
-                if let Some(txt2) = &self.txt2 {
-                    photocraft_text::psd::apply_txt2(&mut t, &block.data, txt2);
-                    // Type on a path keeps its path only in its `Txt2` frame (#7962).
-                    path_error = photocraft_text::psd::apply_txt2_path(&mut t, &block.data, txt2).err();
-                    photocraft_text::psd::apply_txt2_frame(&mut t, &block.data, txt2);
-                }
-                if let Some(e) = path_error {
-                    let shape = if matches!(t.shape, photocraft_doc::text::TextShape::Box { .. }) { "paragraph" } else { "point" };
-                    self.warn(format!("layer \"{name}\": its type path could not be read ({e}); it opens as {shape} text"));
-                }
                 // Photoshop's pixels stay until edited. Writers without type pixels are
                 // rendered by text_import::prepare instead of retaining an empty cache.
                 let cache = self.record_surface(rec, &name);
@@ -1343,7 +1345,7 @@ fn psd_to_document_global(
         damaged,
         fatal_error: None,
         dpi: doc.resolution_dpi,
-        txt2: global.iter().find(|(_, k, _)| k == b"Txt2").and_then(|(_, _, d)| photocraft_text::psd::parse_txt2(d)),
+        txt2: global.iter().find(|(_, k, _)| k == b"Txt2").map(|(_, _, d)| d.as_ref().clone()),
         filter_effects: Vec::new(),
         filter_masks: Default::default(),
         unfiltered: Default::default(),

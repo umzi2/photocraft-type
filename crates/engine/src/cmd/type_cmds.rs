@@ -476,7 +476,81 @@ pub fn apply_para_props(s: &mut ParagraphStyle, p: &Value) -> bool {
         s.hyphenate = v;
         any = true;
     }
+    // Paragraph-panel depth: hanging punctuation, the every-line composer, CJK options and the
+    // hyphenation numbers (`docs/txt2-map.md`; PSD keys in `psd::build::paragraph_properties`).
+    for (k, f) in
+        [("hangingPunctuation", &mut s.hanging_punctuation), ("burasagari", &mut s.burasagari), ("hyphenateCapitalized", &mut s.hyphenate_capitalized)]
+    {
+        if let Some(v) = p.get(k).and_then(Value::as_bool) {
+            *f = v;
+            any = true;
+        }
+    }
+    for (k, f) in [("everyLineComposer", &mut s.every_line_composer)] {
+        if let Some(v) = p.get(k).and_then(Value::as_bool) {
+            *f = v;
+            any = true;
+        }
+    }
+    if let Some(v) = p.get("composer").and_then(Value::as_str) {
+        s.every_line_composer = v == "everyLine";
+        any = true;
+    }
+    if let Some(v) = p.get("kinsokuOrder").and_then(Value::as_u64).and_then(|v| u8::try_from(v).ok()) {
+        s.kinsoku_order = v;
+        any = true;
+    }
+    for (keys, f) in [
+        (&["hyphenateWordsLongerThan", "hyphenateWordSize"][..], &mut s.hyphenate_word_size),
+        (&["hyphenateAfterFirst", "hyphenateMinBefore"][..], &mut s.hyphenate_min_before),
+        (&["hyphenateBeforeLast", "hyphenateMinAfter"][..], &mut s.hyphenate_min_after),
+        (&["hyphenLimit", "consecutiveHyphens"][..], &mut s.hyphen_limit),
+    ] {
+        if let Some(v) = keys.iter().find_map(|k| p.get(*k)).and_then(Value::as_u64).and_then(|v| u8::try_from(v).ok()) {
+            *f = v;
+            any = true;
+        }
+    }
+    if let Some(v) = f32p(p, "hyphenationZone") {
+        s.hyphenation_zone_pt = v.clamp(0.0, 1296.0);
+        any = true;
+    }
+    for (keys, f) in [
+        (&["wordSpacing", "justificationWord"][..], &mut s.justification_word),
+        (&["letterSpacing", "justificationLetter"][..], &mut s.justification_letter),
+        (&["glyphSpacing", "justificationGlyph"][..], &mut s.justification_glyph),
+    ] {
+        if let Some(triple) = keys.iter().find_map(|k| p.get(*k)).and_then(triple) {
+            *f = triple;
+            any = true;
+        }
+    }
     any
+}
+
+/// A justification spacing triple (`[minimum, desired, maximum]`), each value finite and in
+/// Photoshop's range; the three are ordered so `minimum <= desired <= maximum` like Photoshop's
+/// dialog keeps them.
+fn triple(v: &Value) -> Option<[f32; 3]> {
+    let items = v.as_array()?;
+    let mut out = [0.0f32; 3];
+    let mut seen = false;
+    for (slot, value) in out.iter_mut().zip(items.iter()) {
+        if let Some(x) = value.as_f64().map(|x| x as f32).filter(|x| x.is_finite()) {
+            *slot = x.clamp(-10.0, 10.0);
+            seen = true;
+        }
+    }
+    if !seen {
+        return None;
+    }
+    if out[0] > out[1] {
+        out[0] = out[1];
+    }
+    if out[2] < out[1] {
+        out[2] = out[1];
+    }
+    Some(out)
 }
 
 fn push_merge<S: PartialEq>(out: &mut Vec<(usize, S)>, len: usize, st: S) {
@@ -642,17 +716,86 @@ pub fn replace_text(t: &mut TextLayer, a: usize, b: usize, new: &str) {
 
 /// Re-renders the layer's pixels and regenerates its PSD `TySh` data.
 pub fn refresh(doc: &Document, t: &mut TextLayer) {
-    refresh_at(doc.resolution_dpi, doc.pixel_format(), t);
+    let txt2 = txt2_block(doc);
+    refresh_at_with_txt2(doc.resolution_dpi, doc.pixel_format(), t, txt2.as_deref().map(Vec::as_slice));
+}
+
+/// The document's global `Txt2` block: Photoshop's text-engine data, holding the character
+/// features `EngineData` cannot express (old-style figures) for every type layer.
+pub fn txt2_block(doc: &Document) -> Option<Arc<Vec<u8>>> {
+    doc.metadata.psd_global_blocks.iter().find(|(_, key, _)| key == b"Txt2").map(|(_, _, data)| data.clone())
 }
 
 /// [`refresh`] given only the two things it reads from the document: its resolution and its
 /// pixel format. A caller holding the layer mutably reads them first instead of cloning the whole
 /// document to pass it, once per keystroke and pointer move while typing (#7092).
 pub fn refresh_at(dpi: f32, format: PixelFormat, t: &mut TextLayer) {
+    refresh_at_with_txt2(dpi, format, t, None);
+}
+
+/// [`refresh_at`] with the document's `Txt2` block, whose character features (`/6/30`
+/// old-style figures) `EngineData` cannot carry.
+pub fn refresh_at_with_txt2(dpi: f32, format: PixelFormat, t: &mut TextLayer, txt2: Option<&[u8]>) {
+    // A layer that already has pixels (imported from a PSD) keeps its document rectangle: the
+    // re-render paints inside it, so the layer does not move by the difference between the two
+    // rasterisers' ink extents. A new layer has none and derives its rectangle from its ink.
+    let target = t.cache.as_ref().map(|c| c.content_bounds()).filter(|b| !b.is_empty()).map(|b| {
+        (b.x0, b.y0, u32::try_from(b.x1 - b.x0).unwrap_or(1).max(1), u32::try_from(b.y1 - b.y0).unwrap_or(1).max(1))
+    });
+    // Pixels come from the reimplemented Photoshop engine, which draws Photoshop's own glyphs
+    // (the canvas renderer's antialiasing differs, so a view built from it never matches the
+    // PSD's stored pixels). Layers it does not model yet, and wasm builds (no font
+    // filesystem), keep the built-in parley renderer.
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Ok(surface) = render_with_reimplementation(t, dpi, format, txt2, target) {
+        t.cache = Some(surface);
+        // The `TySh` descriptor still keeps the layer's text-space ink bounds, which the
+        // reimplementation's pixel API does not return: take them from the layout the layer is
+        // drawn with (`layer_layout`), so the descriptor and the pixels cannot disagree.
+        let layout = photocraft_text::layer_layout(t, dpi, format);
+        t.psd_raw = Some(Arc::new(photocraft_text::psd::build_tysh(t, dpi, layout.bounds())));
+        return;
+    }
     let mut eng = photocraft_text::shared().lock().unwrap_or_else(|e| e.into_inner());
     let (layout, r) = eng.render(t, dpi, format);
     t.cache = Some(r.surface);
     t.psd_raw = Some(Arc::new(photocraft_text::psd::build_tysh(t, dpi, layout.bounds())));
+}
+
+/// [`refresh_at`]'s pixels from the reimplemented engine, or the reason it declined the layer.
+///
+/// The reason is reported once per kind: an unsupported layer is re-rendered on every
+/// keystroke and pointer move while its text is edited.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn render_with_reimplementation(
+    t: &TextLayer,
+    dpi: f32,
+    format: PixelFormat,
+    txt2: Option<&[u8]>,
+    target: Option<(i32, i32, u32, u32)>,
+) -> std::result::Result<photocraft_raster::Surface, ()> {
+    use std::collections::BTreeSet;
+    use std::sync::{Mutex, OnceLock};
+
+    match photocraft_text::render_re::render_layer_into(t, dpi, format, txt2, target) {
+        Ok((surface, _rect)) => {
+            if photocraft_text::render_re::debug_enabled() {
+                eprintln!("render_re: path=re layer={:?} rect=({},{},{},{})", t.text.chars().take(24).collect::<String>(), _rect.x0, _rect.y0, _rect.x1, _rect.y1);
+            }
+            Ok(surface)
+        }
+        Err(why) => {
+            if photocraft_text::render_re::debug_enabled() {
+                eprintln!("render_re: path=parley layer={:?} reason={why}", t.text.chars().take(24).collect::<String>());
+            }
+            static REPORTED: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+            let reported = REPORTED.get_or_init(|| Mutex::new(BTreeSet::new()));
+            if reported.lock().unwrap_or_else(|e| e.into_inner()).insert(why.0.clone()) {
+                eprintln!("text: the canvas renderer draws this layer because the reimplementation cannot: {why}");
+            }
+            Err(())
+        }
+    }
 }
 
 /// Makes `t` paragraph text in the box `[x, y, width, height]`: the box sits at the text-space
@@ -691,6 +834,7 @@ fn with_text_layer<R>(s: &mut Session, p: &Value, label: &str, f: impl FnOnce(&m
     let mut named = None;
     let (r, damage) = s.edit(label, |doc, _| {
         let (dpi, format) = (doc.resolution_dpi, doc.pixel_format());
+        let txt2 = txt2_block(doc);
         let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
         let auto_named = is_auto_named(l, typed.as_deref());
         let LayerContent::Text(t) = &mut l.content else {
@@ -701,7 +845,7 @@ fn with_text_layer<R>(s: &mut Session, p: &Value, label: &str, f: impl FnOnce(&m
         let old_text = auto_named.then(|| t.text.clone());
         let mut rename = None;
         let r = f(t, dpi, &mut rename)?;
-        refresh_at(dpi, format, t);
+        refresh_at_with_txt2(dpi, format, t, txt2.as_deref().map(Vec::as_slice));
         // Only this layer's pixels changed: the canvas recomposites their old and new area
         // instead of the whole document (#124). Unknown old pixels mean a full refresh.
         let damage = before.zip(t.cache.as_ref().map(|c| c.tile_bounds())).map(|(a, b)| a.union(&b));
@@ -773,13 +917,14 @@ pub(crate) fn with_text_targets(
     }
     let damage = s.edit(label, |doc, _| {
         let (dpi, format) = (doc.resolution_dpi, doc.pixel_format());
+        let txt2 = txt2_block(doc);
         let mut damage = Some(photocraft_geom::Rect::EMPTY);
         for id in &ids {
             let Some(LayerContent::Text(t)) = doc.layer_mut(*id).map(|l| &mut l.content) else { return Err(EngineError::NoLayer(*id)) };
             let before = t.cache.as_ref().map(|c| c.tile_bounds());
             let range = if p.get("layers").is_none() || p.get("layer").is_some() { range_param(&t.text, p) } else { (0, t.text.len()) };
             f(t, range)?;
-            refresh_at(dpi, format, t);
+            refresh_at_with_txt2(dpi, format, t, txt2.as_deref().map(Vec::as_slice));
             // An unknown old/new cache retains Session.edit's full-refresh fallback.
             damage = damage.zip(before).zip(t.cache.as_ref().map(|c| c.tile_bounds())).map(|((all, a), b)| all.union(&a).union(&b));
         }
@@ -878,7 +1023,7 @@ fn info(s: &Session, p: &Value) -> Result<Value> {
             v
         })
         .collect();
-    let layout = photocraft_text::shared().lock().unwrap_or_else(|e| e.into_inner()).layout(t, d.doc.resolution_dpi);
+    let layout = photocraft_text::layer_layout(t, d.doc.resolution_dpi, d.doc.pixel_format());
     let lines: Vec<Value> = layout
         .lines
         .iter()
@@ -1174,7 +1319,7 @@ pub fn specs() -> Vec<CommandSpec> {
             menu: &[],
             shortcut: None,
             params: Box::leak(
-                format!(r##"{{"layer":id? or "layers":[id,…]? (default selected Type layers),"range":[startChar,endChar]? (single layer; default all),"metricsAsShown":bool=false (size/leading/leadingBy include each layer's transform scale), {CHAR_PARAMS}, relative steps from each character's own value: "leadingBy":pt (auto leading starts from its laid-out value; result 0.01..=5000),"baselineShiftBy":pt (result -5000..=5000),"trackingBy":1/1000 em (result -1000..=10000), paragraph keys: "align":"left|center|right|justify|justifyCenter|justifyRight|justifyAll","firstLineIndent":pt,"startIndent":pt,"endIndent":pt,"spaceBefore":pt,"spaceAfter":pt,"autoLeading":%,"direction":"auto|ltr|rtl","hyphenate":bool}}"##)
+                format!(r##"{{"layer":id? or "layers":[id,…]? (default selected Type layers),"range":[startChar,endChar]? (single layer; default all),"metricsAsShown":bool=false (size/leading/leadingBy include each layer's transform scale), {CHAR_PARAMS}, relative steps from each character's own value: "leadingBy":pt (auto leading starts from its laid-out value; result 0.01..=5000),"baselineShiftBy":pt (result -5000..=5000),"trackingBy":1/1000 em (result -1000..=10000), paragraph keys: "align":"left|center|right|justify|justifyCenter|justifyRight|justifyAll","firstLineIndent":pt,"startIndent":pt,"endIndent":pt,"spaceBefore":pt,"spaceAfter":pt,"autoLeading":%,"direction":"auto|ltr|rtl","hyphenate":bool,"hangingPunctuation":bool,"everyLineComposer":bool,"composer":"singleLine|everyLine","burasagari":bool,"kinsokuOrder":0..=2,"hyphenateWordsLongerThan":uint,"hyphenateAfterFirst":uint,"hyphenateBeforeLast":uint,"hyphenLimit":uint,"hyphenationZone":pt,"hyphenateCapitalized":bool,"wordSpacing":[min,desired,max],"letterSpacing":[min,desired,max],"glyphSpacing":[min,desired,max]}}"##)
                     .into_boxed_str(),
             ),
             enabled: has_doc,

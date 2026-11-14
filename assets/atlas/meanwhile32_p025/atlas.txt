@@ -1,0 +1,23 @@
+font CCMeanwhile
+size 32.0
+aa 1
+bold 0
+italic 0
+hscale 1.0
+pen_x 40.0
+baseline_y 120.0
+phase 0.25
+bin atlas.bin
+glyph 0043 0 -26 23 27 0 C
+glyph 0044 1 -26 22 27 621 D
+glyph 004D 0 -26 27 28 1215 M
+glyph 0061 0 -27 21 28 1971 a
+glyph 0065 1 -26 21 27 2559 e
+glyph 0068 1 -28 19 30 3126 h
+glyph 0069 2 -26 4 27 3696 i
+glyph 006C 1 -27 19 29 3804 l
+glyph 006E 1 -27 19 28 4355 n
+glyph 0070 1 -27 22 28 4887 p
+glyph 0073 -1 -27 25 28 5503 s
+glyph 0077 1 -26 30 27 6203 w
+glyph 0079 0 -27 23 28 7013 y

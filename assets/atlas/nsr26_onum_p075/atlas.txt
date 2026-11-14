@@ -1,0 +1,20 @@
+font NotoSans-Regular
+size 26
+aa 1
+bold 0
+italic 0
+hscale 1
+pen_x 40
+baseline_y 120
+phase 0.75
+bin atlas.bin
+glyph 0030 2 -15 13 16 0 gid=08B7
+glyph 0031 1 -15 8 15 208 gid=08B8
+glyph 0032 2 -15 12 15 328 gid=08B9
+glyph 0033 1 -15 13 20 508 gid=08BA
+glyph 0034 1 -15 15 20 768 gid=08BB
+glyph 0035 2 -14 13 19 1068 gid=08BC
+glyph 0036 2 -19 13 20 1315 gid=08BD
+glyph 0037 1 -14 13 19 1575 gid=08BE
+glyph 0038 2 -19 13 20 1822 gid=08BF
+glyph 0039 2 -15 13 20 2082 gid=08C0
